@@ -47,7 +47,6 @@ unsafe extern "C" {
         model_ptr: *mut c_void,
         inputs: *const *const c_char,
         count: usize,
-        html: bool,
         want_alignment: bool,
     ) -> *mut CTranslation;
 
@@ -57,7 +56,6 @@ unsafe extern "C" {
         second_model_ptr: *mut c_void,
         inputs: *const *const c_char,
         count: usize,
-        html: bool,
         want_alignment: bool,
     ) -> *mut CTranslation;
 
@@ -218,13 +216,13 @@ impl BlockingService {
         Self { ptr }
     }
 
-    pub fn translate(&self, model: &TranslationModel, inputs: &[&str], html: bool) -> Vec<String> {
+    pub fn translate(&self, model: &TranslationModel, inputs: &[&str]) -> Vec<String> {
         let (c_inputs, ptrs) = prepare_inputs(inputs);
         if ptrs.is_empty() {
             return Vec::new();
         }
         let raw = unsafe {
-            slimt_service_translate(self.ptr, model.ptr, ptrs.as_ptr(), ptrs.len(), html, false)
+            slimt_service_translate(self.ptr, model.ptr, ptrs.as_ptr(), ptrs.len(), false)
         };
         let out = collect(raw, ptrs.len(), false);
         drop(c_inputs);
@@ -241,7 +239,7 @@ impl BlockingService {
             return Vec::new();
         }
         let raw = unsafe {
-            slimt_service_translate(self.ptr, model.ptr, ptrs.as_ptr(), ptrs.len(), false, true)
+            slimt_service_translate(self.ptr, model.ptr, ptrs.as_ptr(), ptrs.len(), true)
         };
         let out = collect(raw, ptrs.len(), true);
         drop(c_inputs);
@@ -253,7 +251,6 @@ impl BlockingService {
         first: &TranslationModel,
         second: &TranslationModel,
         inputs: &[&str],
-        html: bool,
     ) -> Vec<String> {
         let (c_inputs, ptrs) = prepare_inputs(inputs);
         if ptrs.is_empty() {
@@ -266,7 +263,6 @@ impl BlockingService {
                 second.ptr,
                 ptrs.as_ptr(),
                 ptrs.len(),
-                html,
                 false,
             )
         };
@@ -292,7 +288,6 @@ impl BlockingService {
                 second.ptr,
                 ptrs.as_ptr(),
                 ptrs.len(),
-                false,
                 true,
             )
         };

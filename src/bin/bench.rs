@@ -58,10 +58,10 @@ fn main() {
 
     // Warm up: translate the first line once so JIT-y caches / first-touch
     // page faults don't pollute the timed run.
-    let _ = service.translate(&model, &[line_refs[0]], false);
+    let _ = service.translate(&model, &[line_refs[0]]);
 
     let t0 = Instant::now();
-    let outs = service.translate(&model, &line_refs, false);
+    let outs = service.translate(&model, &line_refs);
     let dt = t0.elapsed();
     assert_eq!(outs.len(), line_refs.len());
 

@@ -28,7 +28,7 @@ fn main() {
     let service = BlockingService::with_workers(4, 0);
 
     let inputs = vec![text.as_str()];
-    let outs = service.translate(&model, &inputs, false);
+    let outs = service.translate(&model, &inputs);
     for (i, t) in outs.iter().enumerate() {
         println!("[{i}] {t}");
     }

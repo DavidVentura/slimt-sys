@@ -265,17 +265,12 @@ CTranslation* slimt_service_translate(void* service_ptr,
                                       void* model_ptr,
                                       const char* const* inputs,
                                       size_t count,
-                                      bool html,
                                       bool want_alignment) {
     try {
         auto* service = static_cast<Async*>(service_ptr);
         auto& model = *static_cast<std::shared_ptr<Model>*>(model_ptr);
 
         Options options;
-        options.html = html;
-        // slimt's frontend now folds `html` into `alignment` itself, so we
-        // only need to forward the caller's intent — whether they want the
-        // alignments echoed back through the C ABI.
         options.alignment = want_alignment;
 
         std::vector<Handle> handles;
@@ -289,8 +284,7 @@ CTranslation* slimt_service_translate(void* service_ptr,
     } catch (const std::exception& e) {
         record_error("slimt_service_translate", e.what());
         for (size_t i = 0; i < count; ++i) {
-            SLIMT_LOG("input[%zu] (html=%d): %s", i, (int)html,
-                      log_excerpt(inputs[i]).c_str());
+            SLIMT_LOG("input[%zu]: %s", i, log_excerpt(inputs[i]).c_str());
         }
         return nullptr;
     } catch (...) {
@@ -304,7 +298,6 @@ CTranslation* slimt_service_pivot(void* service_ptr,
                                   void* second_model_ptr,
                                   const char* const* inputs,
                                   size_t count,
-                                  bool html,
                                   bool want_alignment) {
     SLIMT_TRY_ENTRY("slimt_service_pivot")
         auto* service = static_cast<Async*>(service_ptr);
@@ -312,10 +305,7 @@ CTranslation* slimt_service_pivot(void* service_ptr,
         auto& second = *static_cast<std::shared_ptr<Model>*>(second_model_ptr);
 
         Options options;
-        options.html = html;
-        // See slimt_service_translate: HTML restore needs alignments
-        // internally regardless of whether the caller asked for them.
-        options.alignment = want_alignment || html;
+        options.alignment = want_alignment;
 
         std::vector<Handle> handles;
         handles.reserve(count);
