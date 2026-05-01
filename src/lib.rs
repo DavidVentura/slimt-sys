@@ -61,6 +61,18 @@ unsafe extern "C" {
     ) -> *mut CTranslation;
 
     fn slimt_translations_delete(results: *mut CTranslation, count: usize);
+
+    fn slimt_last_error() -> *const c_char;
+}
+
+fn last_error() -> String {
+    let raw = unsafe { slimt_last_error() };
+    if raw.is_null() {
+        return "unknown error".to_string();
+    }
+    unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn path_to_cstring(path: &Path) -> CString {
@@ -148,7 +160,7 @@ impl TranslationModel {
             )
         };
         if ptr.is_null() {
-            return Err("Failed to create slimt model".to_string());
+            return Err(format!("Failed to create slimt model: {}", last_error()));
         }
         Ok(Self { ptr })
     }
@@ -174,7 +186,11 @@ impl BlockingService {
 
     pub fn with_workers(workers: usize, cache_size: usize) -> Self {
         let ptr = unsafe { slimt_service_new(workers, cache_size) };
-        assert!(!ptr.is_null(), "Failed to create slimt service");
+        assert!(
+            !ptr.is_null(),
+            "Failed to create slimt service: {}",
+            last_error()
+        );
         Self { ptr }
     }
 
@@ -276,7 +292,11 @@ fn collect(
     count: usize,
     want_alignment: bool,
 ) -> Vec<TranslationWithAlignment> {
-    assert!(!raw.is_null(), "slimt translation failed");
+    assert!(
+        !raw.is_null(),
+        "slimt translation failed: {}",
+        last_error()
+    );
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let c_result = unsafe { &*raw.add(i) };
