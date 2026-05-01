@@ -269,7 +269,11 @@ CTranslation* slimt_service_translate(void* service_ptr,
 
         Options options;
         options.html = html;
-        options.alignment = want_alignment;
+        // HTML restore needs alignments to map translated tokens back to
+        // their source tags. The caller's want_alignment only controls
+        // whether we expose alignments through the C ABI, not whether the
+        // engine produces them internally.
+        options.alignment = want_alignment || html;
 
         std::vector<Handle> handles;
         handles.reserve(count);
