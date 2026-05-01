@@ -134,11 +134,15 @@ void* slimt_model_new(const char* model_path,
                       size_t encoder_layers,
                       size_t decoder_layers,
                       size_t feed_forward_depth,
-                      size_t num_heads) {
+                      size_t num_heads,
+                      const char* target_vocabulary_path) {
     SLIMT_TRY_ENTRY("slimt_model_new")
         Package<std::string> package{
             .model = model_path ? std::string(model_path) : std::string(),
             .vocabulary = vocabulary_path ? std::string(vocabulary_path) : std::string(),
+            .target_vocabulary = target_vocabulary_path
+                                     ? std::string(target_vocabulary_path)
+                                     : std::string(),
             .shortlist = shortlist_path ? std::string(shortlist_path) : std::string(),
             .ssplit = ssplit_path ? std::string(ssplit_path) : std::string(),
         };

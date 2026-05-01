@@ -38,6 +38,7 @@ unsafe extern "C" {
         decoder_layers: usize,
         feed_forward_depth: usize,
         num_heads: usize,
+        target_vocabulary_path: *const c_char,
     ) -> *mut c_void;
     fn slimt_model_delete(model_ptr: *mut c_void);
 
@@ -140,10 +141,29 @@ impl TranslationModel {
         ssplit: Option<&Path>,
         arch: ModelArch,
     ) -> Result<Self, String> {
+        Self::with_arch_and_target_vocab(
+            model, vocabulary, shortlist, ssplit, arch, None,
+        )
+    }
+
+    /// Two-vocab models (Mozilla's bergamot en-zh, en-ja, en-ko, en-zh_hant,
+    /// zh_hant-en) ship a `srcvocab.*.spm` and a `trgvocab.*.spm` and have
+    /// separate `encoder_Wemb` / `decoder_Wemb` tensors. Pass the source
+    /// vocab as `vocabulary` and the target vocab via `target_vocabulary`.
+    /// Single-vocab models pass `target_vocabulary=None`.
+    pub fn with_arch_and_target_vocab(
+        model: &Path,
+        vocabulary: &Path,
+        shortlist: &Path,
+        ssplit: Option<&Path>,
+        arch: ModelArch,
+        target_vocabulary: Option<&Path>,
+    ) -> Result<Self, String> {
         let model_c = path_to_cstring(model);
         let vocab_c = path_to_cstring(vocabulary);
         let short_c = path_to_cstring(shortlist);
         let ssplit_c = ssplit.map(path_to_cstring);
+        let tgt_vocab_c = target_vocabulary.map(path_to_cstring);
         let ptr = unsafe {
             slimt_model_new(
                 model_c.as_ptr(),
@@ -157,6 +177,10 @@ impl TranslationModel {
                 arch.decoder_layers,
                 arch.feed_forward_depth,
                 arch.num_heads,
+                tgt_vocab_c
+                    .as_ref()
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(std::ptr::null()),
             )
         };
         if ptr.is_null() {
