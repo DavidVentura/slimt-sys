@@ -1,0 +1,4 @@
+[submodule "vendor/slimt"]
+	path = vendor/slimt
+	url = https://github.com/DavidVentura/slimt.git
+	branch = main

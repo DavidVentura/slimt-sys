@@ -2,42 +2,19 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-fn latest_android_ndk_from_sdk() -> Option<PathBuf> {
-    let sdk_root = env::var_os("ANDROID_SDK_ROOT")
-        .or_else(|| env::var_os("ANDROID_HOME"))
-        .map(PathBuf::from)?;
-    let ndk_root = sdk_root.join("ndk");
-    let mut entries = fs::read_dir(ndk_root)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    entries.sort();
-    entries.pop()
-}
-
-fn android_ndk_root() -> Option<PathBuf> {
-    env::var_os("ANDROID_NDK_ROOT")
-        .or_else(|| env::var_os("ANDROID_NDK_HOME"))
-        .or_else(|| env::var_os("ANDROID_NDK"))
-        .map(PathBuf::from)
-        .or_else(latest_android_ndk_from_sdk)
-}
-
+/// Set `SLIMT_SOURCE_DIR` to point at a sibling working copy when iterating on slimt itself
 fn slimt_source_dir() -> PathBuf {
     if let Ok(dir) = env::var("SLIMT_SOURCE_DIR") {
         return PathBuf::from(dir);
     }
     let cargo_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(parent) = cargo_manifest.parent() {
-        let candidate = parent.join("slimt");
-        if candidate.join("CMakeLists.txt").exists() {
-            return candidate;
-        }
-    }
-    let home = env::var("HOME").expect("HOME is required to locate slimt sources");
-    PathBuf::from(home).join("git/slimt")
+    let vendored = cargo_manifest.join("vendor/slimt");
+    assert!(
+        vendored.join("CMakeLists.txt").exists(),
+        "slimt source not found at {} — run `git submodule update --init --recursive`, or set SLIMT_SOURCE_DIR to a checkout you want to build against",
+        vendored.display(),
+    );
+    vendored
 }
 
 fn main() {
@@ -66,11 +43,12 @@ fn main() {
     let is_arm = target_arch == "aarch64" || target_arch == "arm";
 
     let slimt_dir = slimt_source_dir();
-    assert!(
-        slimt_dir.join("CMakeLists.txt").exists(),
-        "slimt source not found at {} (set SLIMT_SOURCE_DIR)",
-        slimt_dir.display(),
-    );
+    if let Ok(dir) = env::var("SLIMT_SOURCE_DIR") {
+        assert!(
+            PathBuf::from(&dir).join("CMakeLists.txt").exists(),
+            "SLIMT_SOURCE_DIR={dir} does not contain a slimt CMakeLists.txt",
+        );
+    }
 
     // Default to clang on x86 hosts: ~10 % faster than the system gcc on the
     // moby-dick benchmark, and clang's LLVM bitcode lines up with rust-lld so
@@ -128,14 +106,6 @@ fn main() {
         config.define("SLIMT_PROFILE_BUILD", "ON");
     }
 
-    // Mirror bergamot's compute backend layout, fully static:
-    //   * x86  -> intgemm drives int8 GEMM, ruy provides sgemm
-    //             (we keep WITH_RUY=ON to build & link ruy; the wrapper's
-    //             CMakeLists strips SLIMT_HAS_RUY from slimt-static so the QMM
-    //             dispatch picks intgemm without colliding with ruy's qmm).
-    //   * arm  -> ruy for both int8 and sgemm.
-    // BLAS is always OFF: linking system BLAS would break standalone
-    // distribution (e.g. APKs) and we don't need it when ruy is available.
     config.define("WITH_BLAS", "OFF");
     if is_x86 {
         let baseline = if target_arch == "x86_64" {
@@ -154,62 +124,28 @@ fn main() {
             .define("WITH_RUY", "ON");
     }
 
-    if is_android {
-        let android_abi = match target_arch.as_str() {
-            "aarch64" => "arm64-v8a",
-            "arm" => "armeabi-v7a",
-            "x86_64" => "x86_64",
-            "x86" => "x86",
-            _ => panic!("Unsupported Android target arch: {target_arch}"),
-        };
-        let android_platform = env::var("CARGO_NDK_PLATFORM")
-            .ok()
-            .filter(|value| value.chars().all(|ch| ch.is_ascii_digit()))
-            .or_else(|| {
-                env::var("ANDROID_PLATFORM")
-                    .ok()
-                    .and_then(|value| value.strip_prefix("android-").map(str::to_string))
-                    .filter(|value| value.chars().all(|ch| ch.is_ascii_digit()))
-            })
-            .unwrap_or_else(|| "21".to_string());
-        let ndk_root = android_ndk_root()
-            .expect("Android target requires ANDROID_NDK_ROOT or ANDROID_SDK_ROOT");
-
-        config
-            .generator("Ninja")
-            .define(
-                "CMAKE_TOOLCHAIN_FILE",
-                ndk_root.join("build/cmake/android.toolchain.cmake"),
-            )
-            .define("ANDROID_ABI", android_abi)
-            .define("ANDROID_PLATFORM", format!("android-{android_platform}"));
-    }
-
-    if target != host && !is_android {
-        let cmake_system_processor = match target_arch.as_str() {
-            "x86_64" => "x86_64",
-            "x86" => "i686",
-            "aarch64" => "aarch64",
-            "arm" => "armv7",
-            _ => &target_arch,
-        };
-
-        let cmake_c_compiler = match target_arch.as_str() {
-            "aarch64" => "aarch64-linux-gnu-gcc",
-            "arm" => "arm-linux-gnueabihf-gcc",
-            _ => "gcc",
-        };
-
-        let cmake_cxx_compiler = match target_arch.as_str() {
-            "aarch64" => "aarch64-linux-gnu-g++",
-            "arm" => "arm-linux-gnueabihf-g++",
-            _ => "g++",
-        };
-
-        config.define("CMAKE_SYSTEM_NAME", "Linux");
-        config.define("CMAKE_SYSTEM_PROCESSOR", cmake_system_processor);
-        config.define("CMAKE_C_COMPILER", cmake_c_compiler);
-        config.define("CMAKE_CXX_COMPILER", cmake_cxx_compiler);
+    // For Android, set in the calling environment:
+    //   CMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake
+    //   ANDROID_ABI=arm64-v8a   (or x86_64 / armeabi-v7a / x86)
+    //   ANDROID_PLATFORM=android-21
+    //   CMAKE_GENERATOR=Ninja   (cmake-rs reads this directly)
+    //
+    // For other cross-compiles, set CMAKE_SYSTEM_NAME / _PROCESSOR /
+    // CMAKE_C_COMPILER / CMAKE_CXX_COMPILER yourself (or a toolchain
+    // file).
+    for var in [
+        "CMAKE_TOOLCHAIN_FILE",
+        "CMAKE_SYSTEM_NAME",
+        "CMAKE_SYSTEM_PROCESSOR",
+        "CMAKE_C_COMPILER",
+        "CMAKE_CXX_COMPILER",
+        "ANDROID_ABI",
+        "ANDROID_PLATFORM",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+        if let Ok(value) = env::var(var) {
+            config.define(var, &value);
+        }
     }
 
     let dst = config.build();
