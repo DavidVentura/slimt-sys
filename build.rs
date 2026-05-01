@@ -79,11 +79,7 @@ fn main() {
         .define("BUILD_JNI", "OFF")
         .define("USE_BUILTIN_SENTENCEPIECE", "ON")
         .define("SPM_ENABLE_SHARED", "OFF")
-        .define("SPM_ENABLE_TCMALLOC", "OFF")
-        // Vendor pcre2 statically: slimt downloads + builds pcre2-8 inside the
-        // CMake build dir. This keeps the resulting .a self-contained for APK
-        // distribution without depending on the host's libpcre2-8.
-        .define("SLIMT_USE_INTERNAL_PCRE2", "ON");
+        .define("SPM_ENABLE_TCMALLOC", "OFF");
 
     // C++ LTO. On by default when the C++ compiler is clang (LLVM bitcode
     // matches rust-lld natively, ~8 % perf win on the moby-dick bench).
@@ -236,10 +232,6 @@ fn main() {
         println!("cargo:rustc-link-lib=static=cpuinfo");
         println!("cargo:rustc-link-lib=static=clog");
     }
-
-    // PCRE2 is built and installed by slimt (SLIMT_USE_INTERNAL_PCRE2=ON) into
-    // the build dir's `lib/` (already on the search path).
-    println!("cargo:rustc-link-lib=static=pcre2-8");
 
     if is_android {
         println!("cargo:rustc-link-lib=c++_shared");
