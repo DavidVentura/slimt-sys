@@ -1,0 +1,25 @@
+[package]
+name = "slimt-sys"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+
+[build-dependencies]
+cmake = "0.1"
+
+[lib]
+name = "slimt_sys"
+path = "src/lib.rs"
+
+[[bin]]
+name = "smoke"
+path = "src/bin/smoke.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[profile.release]
+lto = "fat"
