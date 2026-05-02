@@ -102,16 +102,12 @@ fn main() {
         config.define("SLIMT_PROFILE_BUILD", "ON");
     }
 
-    // Match marian-bergamot's float behavior. Marian builds with gcc's default
-    // -ffp-contract=fast, which fuses adjacent mul+add (notably intgemm's
-    // per-tile unquant+bias callback `mul_ps; add_ps;`) into a single
-    // vfmadd231ps. Clang's default -ffp-contract=on does NOT cross-statement-
-    // fuse, so the same source produces two roundings instead of one and the
-    // resulting 1-ULP drift compounds through 12 transformer layers and
-    // occasionally flips a decoder argmax. -ffast-math is the broader form
-    // (also enables -ffinite-math-only etc); none of marian's tensors carry
-    // NaN/Inf so this is safe, and the FMA path is also marginally faster.
+    // -ffp-contract=fast matches marian behavior, which fuses
+    // some ops. without it, we have a slight deviation
+    //
+    // finite-math-only breaks on ARM; produces nonsensical output
     config.cxxflag("-ffast-math");
+    config.cxxflag("-fno-finite-math-only");
     config.cxxflag("-ffp-contract=fast");
     config.cxxflag("-Wno-unused-command-line-argument");
     config.cxxflag("-Wno-nan-infinity-disabled");
