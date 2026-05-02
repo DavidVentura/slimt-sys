@@ -139,9 +139,7 @@ impl TranslationModel {
         ssplit: Option<&Path>,
         arch: ModelArch,
     ) -> Result<Self, String> {
-        Self::with_arch_and_target_vocab(
-            model, vocabulary, shortlist, ssplit, arch, None,
-        )
+        Self::with_arch_and_target_vocab(model, vocabulary, shortlist, ssplit, arch, None)
     }
 
     /// Two-vocab models (Mozilla's bergamot en-zh, en-ja, en-ko, en-zh_hant,
@@ -311,11 +309,7 @@ fn collect(
     count: usize,
     want_alignment: bool,
 ) -> Vec<TranslationWithAlignment> {
-    assert!(
-        !raw.is_null(),
-        "slimt translation failed: {}",
-        last_error()
-    );
+    assert!(!raw.is_null(), "slimt translation failed: {}", last_error());
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let c_result = unsafe { &*raw.add(i) };
