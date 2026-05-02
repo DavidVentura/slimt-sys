@@ -40,7 +40,6 @@ fn main() {
     let host = env::var("HOST").unwrap();
     let is_android = target_os == "android";
     let is_x86 = target_arch == "x86_64" || target_arch == "x86";
-    let is_arm = target_arch == "aarch64" || target_arch == "arm";
 
     let slimt_dir = slimt_source_dir();
     if let Ok(dir) = env::var("SLIMT_SOURCE_DIR") {
@@ -72,7 +71,6 @@ fn main() {
         .define("CMAKE_BUILD_TYPE", "Release")
         .define("SLIMT_SOURCE_DIR", slimt_dir.to_str().unwrap())
         .define("WITH_TESTS", "OFF")
-        .define("WITH_GEMMOLOGY", "OFF")
         .define("BUILD_SHARED", "OFF")
         .define("BUILD_STATIC", "ON")
         .define("BUILD_PYTHON", "OFF")
@@ -111,22 +109,13 @@ fn main() {
     config.cxxflag("-ffp-contract=fast");
     config.cxxflag("-Wno-unused-command-line-argument");
     config.cxxflag("-Wno-nan-infinity-disabled");
-    config.define("WITH_BLAS", "OFF");
     if is_x86 {
         let baseline = if target_arch == "x86_64" {
             "x86-64-v2"
         } else {
             "i686"
         };
-        config
-            .define("WITH_INTGEMM", "ON")
-            .define("WITH_RUY", "ON")
-            .define("SLIMT_FORCE_INTGEMM_QMM_WITH_RUY_SGEMM", "ON")
-            .define("SLIMT_X86_BASELINE", baseline);
-    } else {
-        config
-            .define("WITH_INTGEMM", "OFF")
-            .define("WITH_RUY", "ON");
+        config.define("SLIMT_X86_BASELINE", baseline);
     }
 
     // For Android, set in the calling environment:
@@ -166,10 +155,6 @@ fn main() {
         build_dir.display()
     );
     println!(
-        "cargo:rustc-link-search=native={}/slimt/3rd-party/intgemm",
-        build_dir.display()
-    );
-    println!(
         "cargo:rustc-link-search=native={}/slimt/3rd-party/ruy/ruy",
         build_dir.display()
     );
@@ -191,56 +176,48 @@ fn main() {
     println!("cargo:rustc-link-lib=static=slimt");
     println!("cargo:rustc-link-lib=static=sentencepiece");
 
-    let link_ruy = is_x86 || is_arm || (target_arch != "x86_64" && target_arch != "x86");
-
-    if is_x86 {
-        println!("cargo:rustc-link-lib=static=intgemm");
+    for lib in [
+        "ruy_ctx",
+        "ruy_context",
+        "ruy_context_get_ctx",
+        "ruy_frontend",
+        "ruy_trmul",
+        "ruy_prepare_packed_matrices",
+        "ruy_system_aligned_alloc",
+        "ruy_allocator",
+        "ruy_block_map",
+        "ruy_blocking_counter",
+        "ruy_cpuinfo",
+        "ruy_denormal",
+        "ruy_thread_pool",
+        "ruy_tune",
+        "ruy_wait",
+        "ruy_prepacked_cache",
+        "ruy_apply_multiplier",
+        "ruy_profiler_instrumentation",
+    ] {
+        println!("cargo:rustc-link-lib=static={lib}");
     }
-
-    if link_ruy {
+    if is_x86 {
         for lib in [
-            "ruy_ctx",
-            "ruy_context",
-            "ruy_context_get_ctx",
-            "ruy_frontend",
-            "ruy_trmul",
-            "ruy_prepare_packed_matrices",
-            "ruy_system_aligned_alloc",
-            "ruy_allocator",
-            "ruy_block_map",
-            "ruy_blocking_counter",
-            "ruy_cpuinfo",
-            "ruy_denormal",
-            "ruy_thread_pool",
-            "ruy_tune",
-            "ruy_wait",
-            "ruy_prepacked_cache",
-            "ruy_apply_multiplier",
-            "ruy_profiler_instrumentation",
+            "ruy_have_built_path_for_avx",
+            "ruy_have_built_path_for_avx2_fma",
+            "ruy_have_built_path_for_avx512",
+            "ruy_kernel_avx",
+            "ruy_kernel_avx2_fma",
+            "ruy_kernel_avx512",
+            "ruy_pack_avx",
+            "ruy_pack_avx2_fma",
+            "ruy_pack_avx512",
         ] {
             println!("cargo:rustc-link-lib=static={lib}");
         }
-        if is_x86 {
-            for lib in [
-                "ruy_have_built_path_for_avx",
-                "ruy_have_built_path_for_avx2_fma",
-                "ruy_have_built_path_for_avx512",
-                "ruy_kernel_avx",
-                "ruy_kernel_avx2_fma",
-                "ruy_kernel_avx512",
-                "ruy_pack_avx",
-                "ruy_pack_avx2_fma",
-                "ruy_pack_avx512",
-            ] {
-                println!("cargo:rustc-link-lib=static={lib}");
-            }
-        } else {
-            println!("cargo:rustc-link-lib=static=ruy_kernel_arm");
-            println!("cargo:rustc-link-lib=static=ruy_pack_arm");
-        }
-        println!("cargo:rustc-link-lib=static=cpuinfo");
-        println!("cargo:rustc-link-lib=static=clog");
+    } else {
+        println!("cargo:rustc-link-lib=static=ruy_kernel_arm");
+        println!("cargo:rustc-link-lib=static=ruy_pack_arm");
     }
+    println!("cargo:rustc-link-lib=static=cpuinfo");
+    println!("cargo:rustc-link-lib=static=clog");
 
     if is_android {
         println!("cargo:rustc-link-lib=c++_shared");

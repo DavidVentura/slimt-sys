@@ -18,7 +18,7 @@ set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 # Optional C++ link-time optimization. Off by default to match bergamot, but
 # turn-on-able for benchmarking or production builds where the longer link
 # time is acceptable. Honors CMP0069 NEW so it propagates to all targets
-# created after this point (slimt, intgemm, ruy, sentencepiece, our wrapper).
+# created after this point (slimt, ruy, sentencepiece, our wrapper).
 if(SLIMT_ENABLE_LTO)
   include(CheckIPOSupported)
   check_ipo_supported(RESULT _slimt_ipo_supported OUTPUT _slimt_ipo_msg)
@@ -37,9 +37,8 @@ if(SLIMT_ENABLE_LTO)
   endif()
 endif()
 
-# slimt build options - we choose our own backend per arch and avoid extras
+# slimt build options - ruy is the only backend.
 set(WITH_TESTS OFF CACHE BOOL "" FORCE)
-set(WITH_GEMMOLOGY OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(BUILD_PYTHON OFF CACHE BOOL "" FORCE)
@@ -93,22 +92,6 @@ endif()
 include_directories(${SLIMT_SOURCE_DIR} ${CMAKE_BINARY_DIR}/slimt)
 
 add_subdirectory(${SLIMT_SOURCE_DIR} slimt EXCLUDE_FROM_ALL)
-
-# When building on x86 we want intgemm to drive the int8 GEMM kernels (matches
-# bergamot's x86 layout) while ruy handles float sgemm out of TensorOps.cc.
-# slimt's CMake wires both WITH_INTGEMM and WITH_RUY into a shared
-# `kProvider` constexpr in QMM.cc — defining both ABIs in the same TU is a
-# hard error. Strip SLIMT_HAS_RUY from slimt-static's compile definitions:
-# the ruy 3rd-party library is still built and linked (so TensorOps's
-# `#include "ruy/ruy.h"` path resolves) but the QMM dispatch falls
-# exclusively to intgemm.
-if(SLIMT_FORCE_INTGEMM_QMM_WITH_RUY_SGEMM)
-  get_target_property(_slimt_defs slimt-static COMPILE_DEFINITIONS)
-  if(_slimt_defs)
-    list(REMOVE_ITEM _slimt_defs SLIMT_HAS_RUY)
-    set_target_properties(slimt-static PROPERTIES COMPILE_DEFINITIONS "${_slimt_defs}")
-  endif()
-endif()
 
 add_library(slimt_wrapper STATIC slimt_wrapper.cpp)
 target_link_libraries(slimt_wrapper PRIVATE slimt-static)
