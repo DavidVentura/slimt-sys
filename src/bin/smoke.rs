@@ -15,19 +15,36 @@ fn main() {
         .unwrap_or_else(|| "Hola mundo".to_string());
 
     let model_path = base.join(format!("model.{pair}.intgemm.alphas.bin"));
-    let vocab_path = base.join(format!("vocab.{pair}.spm"));
+    let shared_vocab = base.join(format!("vocab.{pair}.spm"));
+    let src_vocab = base.join(format!("srcvocab.{pair}.spm"));
+    let tgt_vocab = base.join(format!("trgvocab.{pair}.spm"));
     let lex_path = base.join(format!("lex.50.50.{pair}.s2t.bin"));
 
     println!("model={}", model_path.display());
-    println!("vocab={}", vocab_path.display());
     println!("lex={}", lex_path.display());
 
     let arch = ModelArch::default();
-    let model = TranslationModel::with_arch(&model_path, &vocab_path, &lex_path, None, arch)
-        .expect("load model");
+    let model = if shared_vocab.exists() {
+        println!("vocab={}", shared_vocab.display());
+        TranslationModel::with_arch(&model_path, &shared_vocab, &lex_path, None, arch)
+    } else {
+        println!("srcvocab={}", src_vocab.display());
+        println!("trgvocab={}", tgt_vocab.display());
+        TranslationModel::with_arch_and_target_vocab(
+            &model_path,
+            &src_vocab,
+            &lex_path,
+            None,
+            arch,
+            Some(&tgt_vocab),
+        )
+    }
+    .expect("load model");
     let service = BlockingService::with_workers(4, 0);
 
-    let inputs = vec![text.as_str()];
+    let extra: Vec<String> = std::env::args().skip(4).collect();
+    let mut inputs: Vec<&str> = vec![text.as_str()];
+    inputs.extend(extra.iter().map(|s| s.as_str()));
     let outs = service.translate(&model, &inputs);
     for (i, t) in outs.iter().enumerate() {
         println!("[{i}] {t}");
