@@ -116,6 +116,10 @@ fn main() {
             "i686"
         };
         config.define("SLIMT_X86_BASELINE", baseline);
+    } else if target_arch == "aarch64" {
+        // Enable slimt's NEON vext path (vectorized softmax/exp, add, sub).
+        // NEON is mandatory on aarch64, so this is always safe here.
+        config.define("USE_NEON", "ON");
     }
 
     // For Android, set in the calling environment:
