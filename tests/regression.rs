@@ -105,6 +105,21 @@ const CASES: &[Case] = &[
         input: "good morning",
         expected: "Buenos días",
     },
+    // en→es: target-length cap. The cap is derived per row from the row's
+    // own (unpadded) source length plus an additive slack; with the purely
+    // multiplicative cap (1.5 × 16 source subwords = 24) this sentence
+    // truncated mid-word ("…en los Arsaci"), and before that the cap came
+    // from the batch's padded length, so whether it truncated depended on
+    // which sentences it was batched with. The guarded property is the
+    // complete "Arsacidas." — the word for "Bower" is a hallucination at
+    // any shortlist size ("Irresponsador" under full-vocab decode,
+    // "Irresponsante" under the topped-up shortlist) and not what this
+    // case is about.
+    Case {
+        pair: "enes",
+        input: "CHAPTER 102. A Bower in the Arsacides.",
+        expected: "CAPÍTULO 102. Un Irresponsante en los Arsacidas.",
+    },
     // en→ja: two-vocab model, no calibrated activation alpha for the output
     // projection. "hello ho" once produced "こんにちはhoforefulforeforefore"
     // because the synthesized alpha saturated the int8 GEMM. Outputs match
