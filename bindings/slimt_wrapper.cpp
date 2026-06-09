@@ -291,15 +291,21 @@ CTranslation* slimt_service_translate(void* service_ptr,
 
         Options options;
         options.alignment = want_alignment;
-        if (on_progress) {
-            options.on_progress = [on_progress, user_data]() {
-                on_progress(user_data, 1);
-            };
-        }
 
         std::vector<Handle> handles;
         handles.reserve(count);
         for (size_t i = 0; i < count; ++i) {
+            // Progress is weighted by source length (bytes), not sentence
+            // count: longer inputs cost proportionally more decode time, so a
+            // length-weighted fraction climbs at a near-constant rate instead
+            // of decelerating as the batcher drains short→long. The per-input
+            // weight is baked into this request's completion callback.
+            if (on_progress) {
+                size_t weight = inputs[i] ? std::strlen(inputs[i]) : 0;
+                options.on_progress = [on_progress, user_data, weight]() {
+                    on_progress(user_data, weight);
+                };
+            }
             std::string source(inputs[i] ? inputs[i] : "");
             handles.push_back(service->translate(model, std::move(source), options));
         }

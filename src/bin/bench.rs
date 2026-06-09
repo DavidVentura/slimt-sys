@@ -155,6 +155,60 @@ fn main() {
     // Warm up.
     let _ = run(paragraphs.len());
 
+    // Scaling probe: is one big translate() linear in sentence count, and does
+    // the per-sentence rate decelerate over a single run? Cycles the corpus to
+    // larger N (cache is off, so duplicates are re-translated).
+    if args.get(5).map(String::as_str) == Some("scale") {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let base: Vec<&str> = sentences_per_para.iter().flatten().copied().collect();
+        eprintln!(
+            "\nscaling (single dump, cache off):\n{:>7} {:>8} {:>9} {:>8}   per-decile seconds",
+            "N", "wall(s)", "words/s", "sec/1k"
+        );
+        for &mult in &[1usize, 2, 4, 8] {
+            let corpus: Vec<&str> = (0..mult).flat_map(|_| base.iter().copied()).collect();
+            let n = corpus.len();
+            let words: usize = corpus.iter().map(|s| s.split_whitespace().count()).sum();
+            // Deciles are over the byte-weighted progress fraction (the callback
+            // now delivers each completed input's byte length), so flat
+            // per-decile times mean the bar climbs at a constant rate.
+            let weight_total: usize = corpus.iter().map(|s| s.len()).sum();
+            let cancel = AtomicBool::new(false);
+            let done = AtomicUsize::new(0);
+            let next = AtomicUsize::new(1);
+            let marks = Mutex::new(Vec::<f64>::new());
+            let t0 = Instant::now();
+            let outs = service
+                .translate_with_progress(&model, &corpus, &cancel, |d| {
+                    let c = done.fetch_add(d, Ordering::Relaxed) + d;
+                    let dec = c * 10 / weight_total;
+                    if dec + 1 > next.fetch_max(dec + 1, Ordering::Relaxed) {
+                        marks.lock().unwrap().push(t0.elapsed().as_secs_f64());
+                    }
+                })
+                .expect("not cancelled");
+            let secs = t0.elapsed().as_secs_f64();
+            assert_eq!(outs.len(), n);
+            let m = marks.lock().unwrap();
+            let mut durs = Vec::new();
+            let mut prev = 0.0;
+            for &t in m.iter() {
+                durs.push(format!("{:.2}", t - prev));
+                prev = t;
+            }
+            eprintln!(
+                "{:>7} {:>8.2} {:>9.0} {:>8.3}   [{}]",
+                n,
+                secs,
+                words as f64 / secs,
+                secs / (n as f64 / 1000.0),
+                durs.join(" ")
+            );
+        }
+        return;
+    }
+
     let all = paragraphs.len();
     let configs = [all, 8, 16, 32, 64, 128, all];
 
