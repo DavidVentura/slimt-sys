@@ -261,17 +261,41 @@ static std::string log_excerpt(const char* s) {
     return out;
 }
 
+// Invoked once per input sentence as it finishes translating, from a worker
+// thread (so concurrently for inputs draining in parallel). `completed` is the
+// number of inputs that just finished — always 1 with the current per-Request
+// granularity. Must be cheap and non-blocking.
+typedef void (*slimt_progress_cb)(void* user_data, size_t completed);
+
+// Disarms the service's cancel flag when this object leaves scope, so a
+// pointer to the caller's (Rust) atomic never outlives the translate call.
+struct CancelGuard {
+    Async* service;
+    ~CancelGuard() { service->set_cancel_flag(nullptr); }
+};
+
 CTranslation* slimt_service_translate(void* service_ptr,
                                       void* model_ptr,
                                       const char* const* inputs,
                                       size_t count,
-                                      bool want_alignment) {
+                                      bool want_alignment,
+                                      slimt_progress_cb on_progress,
+                                      void* user_data,
+                                      const void* cancel_flag) {
     try {
         auto* service = static_cast<Async*>(service_ptr);
         auto& model = *static_cast<std::shared_ptr<Model>*>(model_ptr);
 
+        service->set_cancel_flag(cancel_flag);
+        CancelGuard cancel_guard{service};
+
         Options options;
         options.alignment = want_alignment;
+        if (on_progress) {
+            options.on_progress = [on_progress, user_data]() {
+                on_progress(user_data, 1);
+            };
+        }
 
         std::vector<Handle> handles;
         handles.reserve(count);
@@ -282,6 +306,18 @@ CTranslation* slimt_service_translate(void* service_ptr,
 
         return responses_to_c(drain(handles), want_alignment);
     } catch (const std::exception& e) {
+        // Cancellation completes every in-flight Request's promise through an
+        // exception (the only value-less future completion C++ offers), so the
+        // drain rethrows here as a matter of course. That is not a failure:
+        // produce no error record and no input dump. The caller detects the
+        // cancelled run via its own flag and discards the (nullptr) result.
+        bool cancelled = cancel_flag != nullptr &&
+                         __atomic_load_n(
+                             static_cast<const unsigned char*>(cancel_flag),
+                             __ATOMIC_RELAXED) != 0;
+        if (cancelled) {
+            return nullptr;
+        }
         record_error("slimt_service_translate", e.what());
         for (size_t i = 0; i < count; ++i) {
             SLIMT_LOG("input[%zu]: %s", i, log_excerpt(inputs[i]).c_str());
@@ -298,14 +334,25 @@ CTranslation* slimt_service_pivot(void* service_ptr,
                                   void* second_model_ptr,
                                   const char* const* inputs,
                                   size_t count,
-                                  bool want_alignment) {
-    SLIMT_TRY_ENTRY("slimt_service_pivot")
+                                  bool want_alignment,
+                                  slimt_progress_cb on_progress,
+                                  void* user_data,
+                                  const void* cancel_flag) {
+    try {
         auto* service = static_cast<Async*>(service_ptr);
         auto& first = *static_cast<std::shared_ptr<Model>*>(first_model_ptr);
         auto& second = *static_cast<std::shared_ptr<Model>*>(second_model_ptr);
 
+        service->set_cancel_flag(cancel_flag);
+        CancelGuard cancel_guard{service};
+
         Options options;
         options.alignment = want_alignment;
+        if (on_progress) {
+            options.on_progress = [on_progress, user_data]() {
+                on_progress(user_data, 1);
+            };
+        }
 
         std::vector<Handle> handles;
         handles.reserve(count);
@@ -315,7 +362,20 @@ CTranslation* slimt_service_pivot(void* service_ptr,
         }
 
         return responses_to_c(drain(handles), want_alignment);
-    SLIMT_CATCH_ENTRY("slimt_service_pivot", nullptr)
+    } catch (const std::exception& e) {
+        bool cancelled = cancel_flag != nullptr &&
+                         __atomic_load_n(
+                             static_cast<const unsigned char*>(cancel_flag),
+                             __ATOMIC_RELAXED) != 0;
+        if (cancelled) {
+            return nullptr;
+        }
+        record_error("slimt_service_pivot", e.what());
+        return nullptr;
+    } catch (...) {
+        record_error("slimt_service_pivot", "unknown C++ exception");
+        return nullptr;
+    }
 }
 
 void slimt_translations_delete(CTranslation* results, size_t count) {

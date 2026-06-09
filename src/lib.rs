@@ -25,6 +25,11 @@ pub struct TranslationWithAlignment {
     pub alignments: Vec<TokenAlignment>,
 }
 
+/// Fired once per input sentence as it finishes, from a slimt worker thread
+/// (concurrently across inputs). `completed` is how many just finished — always
+/// 1 at the current per-Request granularity.
+type ProgressCb = unsafe extern "C" fn(user_data: *mut c_void, completed: usize);
+
 unsafe extern "C" {
     fn slimt_service_new(workers: usize, cache_size: usize) -> *mut c_void;
     fn slimt_service_delete(service_ptr: *mut c_void);
@@ -48,6 +53,9 @@ unsafe extern "C" {
         inputs: *const *const c_char,
         count: usize,
         want_alignment: bool,
+        on_progress: Option<ProgressCb>,
+        user_data: *mut c_void,
+        cancel_flag: *const c_void,
     ) -> *mut CTranslation;
 
     fn slimt_service_pivot(
@@ -57,6 +65,9 @@ unsafe extern "C" {
         inputs: *const *const c_char,
         count: usize,
         want_alignment: bool,
+        on_progress: Option<ProgressCb>,
+        user_data: *mut c_void,
+        cancel_flag: *const c_void,
     ) -> *mut CTranslation;
 
     fn slimt_translations_delete(results: *mut CTranslation, count: usize);
@@ -220,11 +231,110 @@ impl BlockingService {
             return Vec::new();
         }
         let raw = unsafe {
-            slimt_service_translate(self.ptr, model.ptr, ptrs.as_ptr(), ptrs.len(), false)
+            slimt_service_translate(
+                self.ptr,
+                model.ptr,
+                ptrs.as_ptr(),
+                ptrs.len(),
+                false,
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
         };
         let out = collect(raw, ptrs.len(), false);
         drop(c_inputs);
         out.into_iter().map(|r| r.target).collect()
+    }
+
+    /// Translate `inputs` in a single batch (so the batcher can pack across all
+    /// of them) while reporting progress and honoring cancellation.
+    ///
+    /// `on_progress` is called from slimt worker threads — concurrently — once
+    /// per input as it finishes, with the number that just completed. It must
+    /// be cheap and non-blocking (e.g. bump an atomic); blocking work there
+    /// serializes the worker pool.
+    ///
+    /// `cancel` is polled by the worker threads. Setting it to `true` (from any
+    /// thread) makes the workers abort pending batches instead of translating
+    /// them, so the call returns within ~one batch per worker. Returns `None`
+    /// when the run was cancelled (partial output is discarded), `Some` with
+    /// one translation per input otherwise. Pass a fresh `false` flag per call.
+    pub fn translate_with_progress<F: Fn(usize) + Sync>(
+        &self,
+        model: &TranslationModel,
+        inputs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_progress: F,
+    ) -> Option<Vec<String>> {
+        let (c_inputs, ptrs) = prepare_inputs(inputs);
+        if ptrs.is_empty() {
+            return Some(Vec::new());
+        }
+        unsafe extern "C" fn trampoline<F: Fn(usize)>(user_data: *mut c_void, completed: usize) {
+            let f = unsafe { &*(user_data as *const F) };
+            f(completed);
+        }
+        let raw = unsafe {
+            slimt_service_translate(
+                self.ptr,
+                model.ptr,
+                ptrs.as_ptr(),
+                ptrs.len(),
+                false,
+                Some(trampoline::<F>),
+                &on_progress as *const F as *mut c_void,
+                cancel as *const std::sync::atomic::AtomicBool as *const c_void,
+            )
+        };
+        drop(c_inputs);
+        if raw.is_null() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            panic!("slimt translation failed: {}", last_error());
+        }
+        let out = collect(raw, ptrs.len(), false);
+        Some(out.into_iter().map(|r| r.target).collect())
+    }
+
+    /// Alignment-bearing counterpart of [`Self::translate_with_progress`]: one
+    /// batch, per-input progress, honors `cancel`. Returns `None` on cancel.
+    pub fn translate_with_alignment_progress<F: Fn(usize) + Sync>(
+        &self,
+        model: &TranslationModel,
+        inputs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_progress: F,
+    ) -> Option<Vec<TranslationWithAlignment>> {
+        let (c_inputs, ptrs) = prepare_inputs(inputs);
+        if ptrs.is_empty() {
+            return Some(Vec::new());
+        }
+        unsafe extern "C" fn trampoline<F: Fn(usize)>(user_data: *mut c_void, completed: usize) {
+            let f = unsafe { &*(user_data as *const F) };
+            f(completed);
+        }
+        let raw = unsafe {
+            slimt_service_translate(
+                self.ptr,
+                model.ptr,
+                ptrs.as_ptr(),
+                ptrs.len(),
+                true,
+                Some(trampoline::<F>),
+                &on_progress as *const F as *mut c_void,
+                cancel as *const std::sync::atomic::AtomicBool as *const c_void,
+            )
+        };
+        drop(c_inputs);
+        if raw.is_null() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            panic!("slimt translation failed: {}", last_error());
+        }
+        Some(collect(raw, ptrs.len(), true))
     }
 
     pub fn translate_with_alignment(
@@ -237,7 +347,16 @@ impl BlockingService {
             return Vec::new();
         }
         let raw = unsafe {
-            slimt_service_translate(self.ptr, model.ptr, ptrs.as_ptr(), ptrs.len(), true)
+            slimt_service_translate(
+                self.ptr,
+                model.ptr,
+                ptrs.as_ptr(),
+                ptrs.len(),
+                true,
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
         };
         let out = collect(raw, ptrs.len(), true);
         drop(c_inputs);
@@ -262,11 +381,57 @@ impl BlockingService {
                 ptrs.as_ptr(),
                 ptrs.len(),
                 false,
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
             )
         };
         let out = collect(raw, ptrs.len(), false);
         drop(c_inputs);
         out.into_iter().map(|r| r.target).collect()
+    }
+
+    /// Cancellable, progress-reporting [`Self::pivot`]. `on_progress` fires once
+    /// per input as its two-leg pivot completes, from a worker thread; `cancel`
+    /// aborts both legs within ~one batch. Returns `None` on cancel.
+    pub fn pivot_with_progress<F: Fn(usize) + Sync>(
+        &self,
+        first: &TranslationModel,
+        second: &TranslationModel,
+        inputs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_progress: F,
+    ) -> Option<Vec<String>> {
+        let (c_inputs, ptrs) = prepare_inputs(inputs);
+        if ptrs.is_empty() {
+            return Some(Vec::new());
+        }
+        unsafe extern "C" fn trampoline<F: Fn(usize)>(user_data: *mut c_void, completed: usize) {
+            let f = unsafe { &*(user_data as *const F) };
+            f(completed);
+        }
+        let raw = unsafe {
+            slimt_service_pivot(
+                self.ptr,
+                first.ptr,
+                second.ptr,
+                ptrs.as_ptr(),
+                ptrs.len(),
+                false,
+                Some(trampoline::<F>),
+                &on_progress as *const F as *mut c_void,
+                cancel as *const std::sync::atomic::AtomicBool as *const c_void,
+            )
+        };
+        drop(c_inputs);
+        if raw.is_null() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            panic!("slimt pivot failed: {}", last_error());
+        }
+        let out = collect(raw, ptrs.len(), false);
+        Some(out.into_iter().map(|r| r.target).collect())
     }
 
     pub fn pivot_with_alignment(
@@ -287,11 +452,54 @@ impl BlockingService {
                 ptrs.as_ptr(),
                 ptrs.len(),
                 true,
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
             )
         };
         let out = collect(raw, ptrs.len(), true);
         drop(c_inputs);
         out
+    }
+
+    /// Cancellable, progress-reporting [`Self::pivot_with_alignment`].
+    pub fn pivot_with_alignment_progress<F: Fn(usize) + Sync>(
+        &self,
+        first: &TranslationModel,
+        second: &TranslationModel,
+        inputs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_progress: F,
+    ) -> Option<Vec<TranslationWithAlignment>> {
+        let (c_inputs, ptrs) = prepare_inputs(inputs);
+        if ptrs.is_empty() {
+            return Some(Vec::new());
+        }
+        unsafe extern "C" fn trampoline<F: Fn(usize)>(user_data: *mut c_void, completed: usize) {
+            let f = unsafe { &*(user_data as *const F) };
+            f(completed);
+        }
+        let raw = unsafe {
+            slimt_service_pivot(
+                self.ptr,
+                first.ptr,
+                second.ptr,
+                ptrs.as_ptr(),
+                ptrs.len(),
+                true,
+                Some(trampoline::<F>),
+                &on_progress as *const F as *mut c_void,
+                cancel as *const std::sync::atomic::AtomicBool as *const c_void,
+            )
+        };
+        drop(c_inputs);
+        if raw.is_null() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            panic!("slimt pivot failed: {}", last_error());
+        }
+        Some(collect(raw, ptrs.len(), true))
     }
 }
 

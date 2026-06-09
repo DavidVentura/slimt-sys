@@ -1,15 +1,89 @@
-//! Throughput benchmark that exercises the translate path away from the
-//! per-page bottleneck of the PDF pipeline. Reads a file (one source per
-//! line), translates the whole batch in a single `translate` call, prints
-//! wall time + words/second.
+//! Throughput benchmark for the translate path. Mirrors the txt "reflow"
+//! caller: merge hard-wrapped lines into paragraphs, then chunk paragraphs the
+//! way the epub/odt/txt paths do (N units per progress tick) and flatten each
+//! chunk's sentences into one slimt call — exactly what `translate_split` does.
+//! Compares chunked calls against a single call over the whole document.
 //!
 //! Usage: bench <model_dir> <pair> <input_file> [WORKERS]
-//!   bench /path/to/bin enes /path/to/moby-dick-2k-lines.txt
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use slimt_sys::{BlockingService, ModelArch, TranslationModel};
+
+/// Group consecutive non-empty lines into paragraphs, collapsing whitespace.
+/// Mirrors translator-rs `txt::split_paragraphs` + `join_paragraph`.
+fn split_paragraphs(text: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    let flush = |cur: &mut Vec<&str>, out: &mut Vec<String>| {
+        if !cur.is_empty() {
+            out.push(cur.join(" ").split_whitespace().collect::<Vec<_>>().join(" "));
+            cur.clear();
+        }
+    };
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            flush(&mut current, &mut paragraphs);
+        } else {
+            current.push(line);
+        }
+    }
+    flush(&mut current, &mut paragraphs);
+    paragraphs
+}
+
+/// Sentence split mirroring translator-rs `sentence_split::split_sentences`:
+/// break after a run of [.!?] when followed by whitespace then an uppercase
+/// letter. Returns slices borrowed from `text`.
+fn split_sentences(text: &str) -> Vec<&str> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut last_end = 0usize;
+    let mut i = 0;
+    while i < n {
+        let c = chars[i].1;
+        if c == '.' || c == '!' || c == '?' {
+            let mut j = i;
+            while j < n && matches!(chars[j].1, '.' | '!' | '?') {
+                j += 1;
+            }
+            let punct_end = if j < n { chars[j].0 } else { text.len() };
+            let mut k = j;
+            let mut saw_ws = false;
+            while k < n && chars[k].1.is_whitespace() {
+                k += 1;
+                saw_ws = true;
+            }
+            if saw_ws && k < n && chars[k].1.is_uppercase() {
+                let piece = &text[last_end..punct_end];
+                if !piece.trim().is_empty() {
+                    out.push(piece);
+                }
+                last_end = chars[k].0;
+                i = k;
+                continue;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    if last_end < text.len() {
+        let tail = &text[last_end..];
+        if !tail.trim().is_empty() {
+            out.push(tail);
+        }
+    }
+    if out.is_empty() {
+        out.push(text);
+    }
+    out
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -30,18 +104,23 @@ fn main() {
     let lex_path = base.join(format!("lex.50.50.{pair}.s2t.bin"));
 
     let raw = std::fs::read_to_string(&input_path).expect("read input");
-    let lines: Vec<String> = raw
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    let total_words: usize = lines.iter().map(|l| l.split_whitespace().count()).sum();
+    let paragraphs = split_paragraphs(&raw);
+    // Flat sentence list per paragraph, kept alongside paragraphs (which own
+    // the backing strings) so chunked runs can slice without re-splitting.
+    let sentences_per_para: Vec<Vec<&str>> =
+        paragraphs.iter().map(|p| split_sentences(p)).collect();
+    let total_sentences: usize = sentences_per_para.iter().map(Vec::len).sum();
+    let total_words: usize = sentences_per_para
+        .iter()
+        .flatten()
+        .map(|s| s.split_whitespace().count())
+        .sum();
 
     eprintln!(
-        "input: {} ({} non-empty lines, {} words)",
+        "input: {} ({} paragraphs, {} sentences, {} words)",
         input_path,
-        line_refs.len(),
+        paragraphs.len(),
+        total_sentences,
         total_words
     );
     eprintln!("model: {} workers={}", pair, workers);
@@ -56,22 +135,103 @@ fn main() {
     .expect("load model");
     let service = BlockingService::with_workers(workers, 0);
 
-    // Warm up: translate the first line once so JIT-y caches / first-touch
-    // page faults don't pollute the timed run.
-    let _ = service.translate(&model, &[line_refs[0]]);
+    // One slimt call per chunk of `chunk` paragraphs; flatten that chunk's
+    // sentences (what translate_split feeds slimt). Returns wall seconds.
+    let run = |chunk: usize| -> (f64, f64) {
+        let mut produced = 0usize;
+        let mut max_words_in_call = 0usize;
+        let t0 = Instant::now();
+        for paras in sentences_per_para.chunks(chunk) {
+            let call: Vec<&str> = paras.iter().flatten().copied().collect();
+            let w: usize = call.iter().map(|s| s.split_whitespace().count()).sum();
+            max_words_in_call = max_words_in_call.max(w);
+            let outs = service.translate(&model, &call);
+            produced += outs.len();
+        }
+        assert_eq!(produced, total_sentences);
+        (t0.elapsed().as_secs_f64(), max_words_in_call as f64)
+    };
 
-    let t0 = Instant::now();
-    let outs = service.translate(&model, &line_refs);
-    let dt = t0.elapsed();
-    assert_eq!(outs.len(), line_refs.len());
+    // Warm up.
+    let _ = run(paragraphs.len());
 
-    let secs = dt.as_secs_f64();
-    let wps = total_words as f64 / secs;
+    let all = paragraphs.len();
+    let configs = [all, 8, 16, 32, 64, 128, all];
+
     eprintln!(
-        "wall: {:.3}s  ({:.1} lines/s, {:.0} words/s)",
-        secs,
-        line_refs.len() as f64 / secs,
-        wps
+        "\n{:>10}  {:>9}  {:>11}  {:>9}  {:>8}",
+        "paras/call", "wall(s)", "words/s", "maxW/call", "vs-1call"
     );
-    println!("{secs:.6}");
+    let mut baseline = 0.0f64;
+    for (i, &chunk) in configs.iter().enumerate() {
+        let (secs, maxw) = run(chunk);
+        if i == 0 {
+            baseline = secs;
+        }
+        let wps = total_words as f64 / secs;
+        let label = if chunk == all {
+            "all".to_string()
+        } else {
+            chunk.to_string()
+        };
+        eprintln!(
+            "{:>10}  {:>9.3}  {:>11.0}  {:>9.0}  {:>7.2}x",
+            label,
+            secs,
+            wps,
+            maxw,
+            secs / baseline
+        );
+    }
+
+    // Option (2): single call over every sentence with a non-blocking progress
+    // callback. Verifies one event fires per input and that the callback adds
+    // no measurable cost versus the no-callback "all" baseline above.
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let all_sentences: Vec<&str> = sentences_per_para.iter().flatten().copied().collect();
+    let counter = AtomicUsize::new(0);
+    let no_cancel = AtomicBool::new(false);
+    let t0 = Instant::now();
+    let outs = service
+        .translate_with_progress(&model, &all_sentences, &no_cancel, |n| {
+            counter.fetch_add(n, Ordering::Relaxed);
+        })
+        .expect("not cancelled");
+    let secs = t0.elapsed().as_secs_f64();
+    assert_eq!(outs.len(), all_sentences.len());
+    eprintln!(
+        "\nprogress single-call: {:.3}s  {:.0} words/s  events={}/{}  (vs no-cb all = {:.2}x)",
+        secs,
+        total_words as f64 / secs,
+        counter.load(Ordering::Relaxed),
+        total_sentences,
+        secs / baseline
+    );
+
+    // Cancellation: flip the flag from another thread shortly after the call
+    // starts and confirm it returns fast (within ~one batch per worker) having
+    // translated only a fraction of the corpus.
+    let done = AtomicUsize::new(0);
+    let cancel = AtomicBool::new(false);
+    let t0 = Instant::now();
+    let result = std::thread::scope(|s| {
+        s.spawn(|| {
+            // Busy-wait until ~150 sentences are in, then cancel.
+            while done.load(Ordering::Relaxed) < 150 && t0.elapsed().as_secs_f64() < 5.0 {
+                std::hint::spin_loop();
+            }
+            cancel.store(true, Ordering::Relaxed);
+        });
+        service.translate_with_progress(&model, &all_sentences, &cancel, |n| {
+            done.fetch_add(n, Ordering::Relaxed);
+        })
+    });
+    let secs = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "cancel test: returned in {:.3}s  result={}  translated {}/{} before stop",
+        secs,
+        if result.is_none() { "None (cancelled)" } else { "Some" },
+        done.load(Ordering::Relaxed),
+        total_sentences,
+    );
 }
