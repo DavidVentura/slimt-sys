@@ -120,6 +120,65 @@ const CASES: &[Case] = &[
         input: "CHAPTER 102. A Bower in the Arsacides.",
         expected: "CAPÍTULO 102. Un Irresponsante en los Arsacidas.",
     },
+    // en→es: shortlist-coverage table. Each case represents an input class
+    // that once starved the shortlist into fluent garbage (ALLCAPS headers,
+    // bare numbers/prices, curly apostrophes, proper nouns, leading dashes,
+    // all-lowercase prose). Guards the candidate top-up: with the bare
+    // 50-frequent + lex-aligned set these produced outputs like "CAPIi 93"
+    // or "- " prefixes; with the full-vocab floor some hallucinated extras
+    // ("Categoría: 1987"). Expectations are x86 outputs of the current
+    // model files (393bc6-era models differ wildly — keep device test files
+    // md5-synced with the bucket before comparing).
+    Case {
+        pair: "enes",
+        input: "CHAPTER 93. The Castaway.",
+        expected: "CAPÍTULO 93. El Náufrago.",
+    },
+    Case {
+        pair: "enes",
+        input: "THE END",
+        expected: "EL FIN",
+    },
+    Case {
+        pair: "enes",
+        input: "WARNING: DO NOT ENTER",
+        expected: "ADVERTENCIA: NO ENTRE",
+    },
+    Case {
+        pair: "enes",
+        input: "IMPORTANT NOTICE",
+        expected: "AVISO IMPORTANTE",
+    },
+    Case {
+        pair: "enes",
+        input: "1987",
+        expected: "1987",
+    },
+    Case {
+        pair: "enes",
+        input: "$4.99",
+        expected: "$4.99",
+    },
+    Case {
+        pair: "enes",
+        input: "Whale’s teeth are large",
+        expected: "Los dientes de ballena son grandes",
+    },
+    Case {
+        pair: "enes",
+        input: "Queequeg was a native of Rokovoko.",
+        expected: "Queequeg era nativo de Rokovoko.",
+    },
+    Case {
+        pair: "enes",
+        input: "- item one",
+        expected: "- artículo uno",
+    },
+    Case {
+        pair: "enes",
+        input: "the quick brown fox jumps over the lazy dog",
+        expected: "El zorro marrón rápido salta sobre el perro perezoso",
+    },
     // en→ja: two-vocab model, no calibrated activation alpha for the output
     // projection. "hello ho" once produced "こんにちはhoforefulforeforefore"
     // because the synthesized alpha saturated the int8 GEMM. Outputs match
