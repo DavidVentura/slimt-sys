@@ -179,6 +179,136 @@ const CASES: &[Case] = &[
         input: "the quick brown fox jumps over the lazy dog",
         expected: "El zorro marrón rápido salta sobre el perro perezoso",
     },
+    // fr→en: knife-edge numerics canary. The "low"/"bas" decision at decoder
+    // step 11 sits 0.84 logits apart in float32; int8 quantization eats
+    // nearly all of that margin and the backend's float-epilogue noise
+    // (~0.2 logits) decides the rest. marian+intgemm lands on "low tide",
+    // marian+ruy on this exact output byte-for-byte. A flip here means the
+    // numerical contract with marian-ruy moved — not necessarily a bug, but
+    // always worth understanding before accepting.
+    Case {
+        pair: "fren",
+        input: "ATTENTION: la boite n'est accessible qu'à \"marrée basse\"",
+        expected: "ATTENTION: the box is only accessible to \"bass tie\"",
+    },
+    // en→es: plain prose table from the 2026-06 slimt-vs-marian numerics
+    // audit (fused layernorm/softmax/FFN, weight concat, shortlist top-up).
+    // At audit time slimt matched marian-ruy on 57/60 such sentences and was
+    // equal-or-closer to float32 on the rest. Pins current outputs so future
+    // optimizations that drift the numerics get flagged.
+    Case {
+        pair: "enes",
+        input: "The meeting starts at nine.",
+        expected: "La reunión comienza a las nueve.",
+    },
+    Case {
+        pair: "enes",
+        input: "Please close the door.",
+        expected: "Por favor, cierre la puerta.",
+    },
+    Case {
+        pair: "enes",
+        input: "Where is the train station?",
+        expected: "¿Dónde está la estación de tren?",
+    },
+    Case {
+        pair: "enes",
+        input: "I forgot my keys again.",
+        expected: "Volví a olvidar mis llaves.",
+    },
+    Case {
+        pair: "enes",
+        input: "The weather looks terrible today.",
+        expected: "El tiempo se ve terrible hoy.",
+    },
+    Case {
+        pair: "enes",
+        input: "She bought three red apples.",
+        expected: "Ella compró tres manzanas rojas.",
+    },
+    Case {
+        pair: "enes",
+        input: "Turn left at the bridge.",
+        expected: "Gire a la izquierda en el puente.",
+    },
+    Case {
+        pair: "enes",
+        input: "The battery is almost dead.",
+        expected: "La batería está casi muerta.",
+    },
+    Case {
+        pair: "enes",
+        input: "The museum is closed on Mondays, but the garden stays open all year.",
+        expected: "El museo está cerrado los lunes, pero el jardín permanece abierto todo el año.",
+    },
+    Case {
+        pair: "enes",
+        input: "If you arrive before noon, ask for the manager at the front desk.",
+        expected: "Si llegas antes del mediodía, pregunta por el gerente en la recepción.",
+    },
+    Case {
+        pair: "enes",
+        input: "The package was delivered to the wrong address for the second time this month.",
+        expected: "El paquete fue entregado a la dirección incorrecta por segunda vez este mes.",
+    },
+    Case {
+        pair: "enes",
+        input: "Our flight was delayed by two hours because of a storm over the mountains.",
+        expected: "Nuestro vuelo se retrasó dos horas debido a una tormenta sobre las montañas.",
+    },
+    Case {
+        pair: "enes",
+        input: "The new software update fixes several bugs but introduces a slower startup time.",
+        expected: "La nueva actualización de software corrija varios errores, pero introduce un tiempo de inicio más lento.",
+    },
+    Case {
+        pair: "enes",
+        input: "He promised to send the report by Friday, yet nobody has received anything.",
+        expected: "Prometió enviar el informe el viernes, pero nadie ha recibido nada.",
+    },
+    Case {
+        pair: "enes",
+        input: "The recipe calls for two cups of flour, a pinch of salt, and three eggs.",
+        expected: "La receta requiere dos tazas de harina, una pizca de sal y tres huevos.",
+    },
+    Case {
+        pair: "enes",
+        input: "Visitors must sign the register before entering the construction site.",
+        expected: "Los visitantes deben firmar el registro antes de entrar en el sitio de construcción.",
+    },
+    Case {
+        pair: "enes",
+        input: "The river floods almost every spring, so the village built a higher bridge.",
+        expected: "El río se inunda casi todas las primaveras, por lo que el pueblo construyó un puente más alto.",
+    },
+    Case {
+        pair: "enes",
+        input: "According to the manual, the red light means the filter needs to be replaced.",
+        expected: "Según el manual, la luz roja significa que el filtro necesita ser reemplazado.",
+    },
+    Case {
+        pair: "enes",
+        input: "The committee will announce its final decision after next week's meeting.",
+        expected: "El comité anunciará su decisión final después de la reunión de la próxima semana.",
+    },
+    Case {
+        pair: "enes",
+        input: "WARNING: the gate is locked after sunset, use the side entrance instead.",
+        expected: "ADVERTENCIA: la puerta está cerrada después de la puesta del sol, utilice la entrada lateral en su lugar.",
+    },
+    // en→es: rare-token shortlist coverage. marian-ruy emits the nonword
+    // "Prube" here (degenerate shortlist for sentence-initial "Try"); the
+    // candidate top-up is what rescues the valid "Pruebe".
+    Case {
+        pair: "enes",
+        input: "Try the bouillabaisse at the quayside bistro in Marseille.",
+        expected: "Pruebe el bouillabaisse en el bistró de muelles en Marsella.",
+    },
+    Case {
+        pair: "enes",
+        input: "Dr. Brzezinski prescribed amoxicillin for the laryngitis.",
+        expected: "El Dr. Brzezinski prescrito amoxicilina para la laringitis.",
+    },
     // en→ja: two-vocab model, no calibrated activation alpha for the output
     // projection. "hello ho" once produced "こんにちはhoforefulforeforefore"
     // because the synthesized alpha saturated the int8 GEMM. Outputs match
