@@ -100,13 +100,19 @@ fn main() {
         config.define("SLIMT_PROFILE_BUILD", "ON");
     }
 
-    // -ffp-contract=fast matches marian behavior, which fuses
-    // some ops. without it, we have a slight deviation
+    // -ffp-contract=off for cross-architecture determinism. With =fast the
+    // compiler fuses a*b+c into a single rounded FMA wherever the target has
+    // one: the x86-64-v2 baseline has no FMA so it can't fuse, but ARM always
+    // can, so the same source rounds differently per arch. Over a long segment
+    // that divergence accumulates until f32->int8 quantization tips to a
+    // different integer, flipping a low-confidence token into garbage on ARM
+    // only. =off makes both arches round identically (the int8 GEMM is already
+    // exact, so this is the sole cross-arch FMA source).
     //
     // finite-math-only breaks on ARM; produces nonsensical output
     config.cxxflag("-ffast-math");
     config.cxxflag("-fno-finite-math-only");
-    config.cxxflag("-ffp-contract=fast");
+    config.cxxflag("-ffp-contract=off");
     config.cxxflag("-Wno-unused-command-line-argument");
     config.cxxflag("-Wno-nan-infinity-disabled");
     if is_x86 {
