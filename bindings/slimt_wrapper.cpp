@@ -175,6 +175,13 @@ void slimt_model_delete(void* model_ptr) {
     }
 }
 
+// slimt::Response::alignments is the soft attention matrix, one row per target
+// token holding its distribution over source tokens. We reduce it to discrete
+// pairs source->target: for each source token, the target token that attends to
+// it most. This guarantees every source token is covered, which is what style
+// transfer needs — a styled source word always reaches a target. (The opposite
+// reduction, target->source argmax, leaves some source words unclaimed and
+// drops their style; column-argmax and row-argmax are not symmetric.)
 static void extract_alignments(const Response& resp, std::vector<CTokenAlignment>& out) {
     const size_t num_sentences = resp.alignments.size();
     for (size_t s = 0; s < num_sentences; ++s) {
@@ -185,16 +192,22 @@ static void extract_alignments(const Response& resp, std::vector<CTokenAlignment
         const auto& sentence_alignments = resp.alignments[s];
         const size_t target_rows = std::min(sentence_alignments.size(), num_target);
 
-        for (size_t t = 0; t < target_rows; ++t) {
-            Range tgt_range = resp.target.word_as_range(s, t);
-            if (tgt_range.begin == tgt_range.end) continue;
+        for (size_t j = 0; j < num_source; ++j) {
+            float best_weight = -1.0F;
+            size_t best_t = target_rows;
+            for (size_t t = 0; t < target_rows; ++t) {
+                const auto& row = sentence_alignments[t];
+                if (j < row.size() && row[j] > best_weight) {
+                    best_weight = row[j];
+                    best_t = t;
+                }
+            }
+            if (best_t == target_rows) continue;
 
-            const auto& row = sentence_alignments[t];
-            if (row.empty()) continue;
-            const size_t row_size = std::min(row.size(), num_source);
-            size_t best_src = std::max_element(row.begin(), row.begin() + row_size) - row.begin();
+            Range src_range = resp.source.word_as_range(s, j);
+            Range tgt_range = resp.target.word_as_range(s, best_t);
+            if (src_range.begin == src_range.end || tgt_range.begin == tgt_range.end) continue;
 
-            Range src_range = resp.source.word_as_range(s, best_src);
             out.push_back(CTokenAlignment{
                 src_range.begin, src_range.end,
                 tgt_range.begin, tgt_range.end});
