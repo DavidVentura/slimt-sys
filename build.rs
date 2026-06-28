@@ -110,8 +110,12 @@ fn main() {
     // exact, so this is the sole cross-arch FMA source).
     //
     // finite-math-only breaks on ARM; produces nonsensical output
-    config.cxxflag("-ffast-math");
-    config.cxxflag("-fno-finite-math-only");
+    // No -ffast-math: its non-IEEE shortcuts (approximate vectorized exp in
+    // softmax/sigmoid, reciprocal-approximated division, denormal flush,
+    // reassociation) accumulate to ~1% divergence from marian's IEEE math over
+    // the deep encoder/decoder and the autoregressive decode, which flips
+    // cross-attention alignment argmaxes (the off-by-one cascade) and even some
+    // token choices. marian deliberately uses strict IEEE here.
     config.cxxflag("-ffp-contract=off");
     config.cxxflag("-Wno-unused-command-line-argument");
     config.cxxflag("-Wno-nan-infinity-disabled");

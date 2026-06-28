@@ -113,12 +113,12 @@ const CASES: &[Case] = &[
     // which sentences it was batched with. The guarded property is the
     // complete "Arsacidas." — the word for "Bower" is a hallucination at
     // any shortlist size ("Irresponsador" under full-vocab decode,
-    // "Irresponsante" under the topped-up shortlist) and not what this
+    // "Intenso" under the topped-up shortlist) and not what this
     // case is about.
     Case {
         pair: "enes",
         input: "CHAPTER 102. A Bower in the Arsacides.",
-        expected: "CAPÍTULO 102. Un Irresponsante en los Arsacidas.",
+        expected: "CAPÍTULO 102. Un Intenso en los Arsacidas.",
     },
     // en→es: shortlist-coverage table. Each case represents an input class
     // that once starved the shortlist into fluent garbage (ALLCAPS headers,
@@ -284,7 +284,7 @@ const CASES: &[Case] = &[
     Case {
         pair: "enes",
         input: "According to the manual, the red light means the filter needs to be replaced.",
-        expected: "Según el manual, la luz roja significa que el filtro necesita ser reemplazado.",
+        expected: "De acuerdo con el manual, la luz roja significa que el filtro necesita ser reemplazado.",
     },
     Case {
         pair: "enes",
