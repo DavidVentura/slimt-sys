@@ -33,7 +33,7 @@
 
 use slimt_sys::{BlockingService, ModelArch, TranslationModel};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct Case {
     pair: &'static str,
@@ -351,6 +351,52 @@ fn models_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Load a `<pair>` model from `<base>/<pair>/`, or `None` (with a printed skip
+/// note) when the pair's files aren't present, so tests degrade to a no-op on
+/// machines without the large model files. Panics if the files exist but fail
+/// to load.
+fn load_pair(base: &Path, pair: &str) -> Option<TranslationModel> {
+    let pair_dir = base.join(pair);
+    let model_path = pair_dir.join(format!("model.{pair}.intgemm.alphas.bin"));
+    let lex_path = pair_dir.join(format!("lex.50.50.{pair}.s2t.bin"));
+    if !model_path.exists() {
+        eprintln!("skip pair={pair}: missing {}", model_path.display());
+        return None;
+    }
+
+    // Two-vocab pairs ship a `srcvocab` + `trgvocab` pair instead of a single
+    // shared `vocab.<pair>.spm`. Detect by file presence.
+    let shared_vocab = pair_dir.join(format!("vocab.{pair}.spm"));
+    let src_vocab = pair_dir.join(format!("srcvocab.{pair}.spm"));
+    let tgt_vocab = pair_dir.join(format!("trgvocab.{pair}.spm"));
+    let model = if shared_vocab.exists() {
+        TranslationModel::with_arch(
+            &model_path,
+            &shared_vocab,
+            &lex_path,
+            None,
+            ModelArch::default(),
+        )
+    } else if src_vocab.exists() && tgt_vocab.exists() {
+        TranslationModel::with_arch_and_target_vocab(
+            &model_path,
+            &src_vocab,
+            &lex_path,
+            None,
+            ModelArch::default(),
+            Some(&tgt_vocab),
+        )
+    } else {
+        eprintln!(
+            "skip pair={pair}: missing vocab (looked for {} and srcvocab/trgvocab)",
+            shared_vocab.display()
+        );
+        return None;
+    }
+    .unwrap_or_else(|e| panic!("load {pair}: {e}"));
+    Some(model)
+}
+
 #[test]
 fn translation_regression_table() {
     let Some(base) = models_dir() else {
@@ -372,44 +418,9 @@ fn translation_regression_table() {
 
     let mut failures: Vec<String> = Vec::new();
     for (pair, cases) in by_pair {
-        let pair_dir = base.join(pair);
-        let model_path = pair_dir.join(format!("model.{pair}.intgemm.alphas.bin"));
-        let lex_path = pair_dir.join(format!("lex.50.50.{pair}.s2t.bin"));
-        if !model_path.exists() {
-            eprintln!("skip pair={pair}: missing {}", model_path.display());
+        let Some(model) = load_pair(&base, pair) else {
             continue;
-        }
-
-        // Two-vocab pairs ship a `srcvocab` + `trgvocab` pair instead of a
-        // single shared `vocab.<pair>.spm`. Detect by file presence.
-        let shared_vocab = pair_dir.join(format!("vocab.{pair}.spm"));
-        let src_vocab = pair_dir.join(format!("srcvocab.{pair}.spm"));
-        let tgt_vocab = pair_dir.join(format!("trgvocab.{pair}.spm"));
-        let model = if shared_vocab.exists() {
-            TranslationModel::with_arch(
-                &model_path,
-                &shared_vocab,
-                &lex_path,
-                None,
-                ModelArch::default(),
-            )
-        } else if src_vocab.exists() && tgt_vocab.exists() {
-            TranslationModel::with_arch_and_target_vocab(
-                &model_path,
-                &src_vocab,
-                &lex_path,
-                None,
-                ModelArch::default(),
-                Some(&tgt_vocab),
-            )
-        } else {
-            eprintln!(
-                "skip pair={pair}: missing vocab (looked for {} and srcvocab/trgvocab)",
-                shared_vocab.display()
-            );
-            continue;
-        }
-        .unwrap_or_else(|e| panic!("load {pair}: {e}"));
+        };
 
         let inputs: Vec<&str> = cases.iter().map(|c| c.input).collect();
         let outs = service.translate(&model, &inputs);
@@ -433,4 +444,49 @@ fn translation_regression_table() {
         CASES.len(),
         failures.join("\n")
     );
+}
+
+/// Pivot with alignment (`de -> en -> es`) once crashed with a SIGSEGV in
+/// `remap_alignments`. `Model::forward` re-decodes low-confidence sentences
+/// with beam search, and the beam path returned hypotheses with an empty
+/// alignment matrix. `combine` then remapped an empty `first.alignments[s]`
+/// against the pivot's word ranges and read out of bounds. "Sauerei" trips the
+/// beam re-decode on the `de -> en` leg (it decodes to "Sorry" with low
+/// confidence), so this guards that beam-decoded legs carry alignments through
+/// the pivot.
+#[test]
+fn pivot_alignment_beam_redecode() {
+    let Some(base) = models_dir() else {
+        eprintln!("SLIMT_TEST_MODELS_DIR not set; skipping pivot alignment test.");
+        return;
+    };
+    let (Some(deen), Some(enes)) = (load_pair(&base, "deen"), load_pair(&base, "enes")) else {
+        eprintln!("skip pivot alignment test: needs deen/ and enes/ model dirs");
+        return;
+    };
+
+    let service = BlockingService::with_workers(4, 0);
+    let outs = service.pivot_with_alignment(&deen, &enes, &["Sauerei"]);
+
+    assert_eq!(outs.len(), 1, "one input, one result");
+    let out = &outs[0];
+    assert_eq!(out.source, "Sauerei");
+    assert!(
+        !out.target.is_empty(),
+        "pivot produced an empty translation for {:?}",
+        out.source
+    );
+    // The empty-alignment bug surfaced as zero alignment rows for a non-empty
+    // translation; a populated matrix is what confirms the beam leg now emits
+    // alignments rather than crashing in remap.
+    assert!(
+        !out.alignments.is_empty(),
+        "pivot with alignment returned no alignments for {:?} -> {:?}",
+        out.source,
+        out.target
+    );
+    for a in &out.alignments {
+        assert!(a.src_begin <= a.src_end, "alignment src span inverted: {a:?}");
+        assert!(a.tgt_begin <= a.tgt_end, "alignment tgt span inverted: {a:?}");
+    }
 }
