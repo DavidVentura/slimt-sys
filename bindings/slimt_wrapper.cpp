@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -6,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -55,6 +57,9 @@ using slimt::Options;
 using slimt::Package;
 using slimt::Range;
 using slimt::Response;
+using slimt::Vocabulary;
+using slimt::Word;
+using slimt::Words;
 
 extern "C" {
 
@@ -65,11 +70,33 @@ struct CTokenAlignment {
     size_t tgt_end;
 };
 
+struct CAlternative {
+    char* text;
+    float prob;
+};
+
+struct CWordAlternatives {
+    size_t tgt_begin;
+    size_t tgt_end;
+    float confidence;
+    CAlternative* options;
+    size_t option_count;
+};
+
 struct CTranslation {
     char* source;
     char* target;
     CTokenAlignment* alignments;
     size_t alignment_count;
+    CWordAlternatives* alternatives;
+    size_t alternatives_count;
+};
+
+struct CTranslateOptions {
+    bool want_alignment;
+    bool want_alternatives;
+    size_t max_alternatives;
+    float gate;
 };
 
 // Returns the last error string set by any wrapper entry point on this
@@ -215,7 +242,145 @@ static void extract_alignments(const Response& resp, std::vector<CTokenAlignment
     }
 }
 
-static CTranslation* responses_to_c(std::vector<Response>&& responses, bool include_alignments) {
+// Whitespace-trim a view (the SentencePiece surface of a word-start piece
+// carries a leading space).
+static std::string_view trim(std::string_view s) {
+    size_t b = 0;
+    size_t e = s.size();
+    while (b < e && (s[b] == ' ')) ++b;
+    while (e > b && (s[e - 1] == ' ')) --e;
+    return s.substr(b, e - b);
+}
+
+static std::string lower(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+// A candidate is a case/inflection variant of the chosen word when they match
+// case-insensitively, or one is a prefix of the other (kills "gran"/"grande",
+// "Mi"/"mi"). Kept deliberately conservative for a first version.
+static bool is_variant(std::string_view a, std::string_view b) {
+    std::string la = lower(a);
+    std::string lb = lower(b);
+    if (la == lb) return true;
+    const std::string& shorter = la.size() < lb.size() ? la : lb;
+    const std::string& longer = la.size() < lb.size() ? lb : la;
+    return !shorter.empty() && longer.compare(0, shorter.size(), shorter) == 0;
+}
+
+// Per target word, harvest the surviving alternatives. slimt already expanded
+// each candidate to a complete word and only kept word-start positions, so the
+// remaining filters are: gate (min prob), reorder (candidate already appears
+// elsewhere in the sentence — an alternative word order, not a synonym), and
+// case/inflection variant.
+static void extract_alternatives(const Response& resp, const Vocabulary& vocab,
+                                 size_t max_alternatives, float gate,
+                                 std::vector<CWordAlternatives>& out) {
+    const size_t num_sentences = resp.alternatives.size();
+    for (size_t s = 0; s < num_sentences; ++s) {
+        const auto& sent_alts = resp.alternatives[s];
+        const size_t ntok = std::min(sent_alts.size(), resp.target.word_count(s));
+        std::string_view sentence = resp.target.sentence(s);
+
+        for (size_t t = 0; t < ntok; ++t) {
+            std::string_view tok = resp.target.word(s, t);
+            bool is_word_start = (t == 0) || (!tok.empty() && tok.front() == ' ');
+            if (!is_word_start) continue;
+
+            const auto& cand = sent_alts[t];
+            if (cand.empty()) continue;
+
+            // The chosen word spans from this word-start token through its
+            // subword continuations. A continuation has no leading space;
+            // punctuation ("." ",") also attaches without a space but is not
+            // part of the word, so stop when a continuation begins with an
+            // ASCII non-word character (accented letters are multi-byte with
+            // the high bit set, and stay part of the word).
+            Range word_range = resp.target.word_as_range(s, t);
+            size_t word_end = word_range.end;
+            for (size_t u = t + 1; u < ntok; ++u) {
+                std::string_view uv = resp.target.word(s, u);
+                if (!uv.empty() && uv.front() == ' ') break;
+                std::string_view uvt = trim(uv);
+                if (uvt.empty()) break;
+                unsigned char c0 = static_cast<unsigned char>(uvt.front());
+                bool word_char = (c0 & 0x80) || std::isalnum(c0);
+                if (!word_char) break;
+                word_end = resp.target.word_as_range(s, u).end;
+            }
+            size_t word_begin = word_range.begin;
+            if (word_begin < resp.target.text.size() &&
+                resp.target.text[word_begin] == ' ') {
+                ++word_begin;  // drop the leading space from the reported span
+            }
+            std::string_view chosen_word =
+                trim(std::string_view(resp.target.text).substr(
+                    word_begin, word_end - word_begin));
+
+            std::vector<CAlternative> options;
+            std::vector<std::string> seen;
+            for (size_t k = 1; k < cand.size() && options.size() < max_alternatives;
+                 ++k) {
+                if (cand[k].prob < gate) break;  // sorted descending
+                std::string decoded;
+                vocab.decode(cand[k].word, decoded, /*ignore_eos=*/true);
+                std::string_view alt = trim(decoded);
+                if (alt.empty()) continue;
+                if (is_variant(alt, chosen_word)) continue;
+
+                // Distinct expansions can converge on the same word (e.g. "buen"
+                // and "bueno" both complete to "bueno"); keep the first (highest
+                // probability) only.
+                std::string key = lower(alt);
+                if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+                    continue;
+                }
+                seen.push_back(key);
+
+                // Reorder: the candidate word already appears elsewhere in the
+                // sentence (as a spaced token), so it's a word-order variant.
+                std::string spaced = " " + std::string(alt);
+                size_t at = sentence.find(spaced);
+                bool elsewhere = false;
+                while (at != std::string_view::npos) {
+                    size_t abs = (sentence.data() - resp.target.text.data()) + at;
+                    if (abs + 1 < word_begin || abs + 1 >= word_end) {
+                        elsewhere = true;
+                        break;
+                    }
+                    at = sentence.find(spaced, at + 1);
+                }
+                if (elsewhere) continue;
+
+                char* text = new char[alt.size() + 1];
+                std::memcpy(text, alt.data(), alt.size());
+                text[alt.size()] = '\0';
+                options.push_back(CAlternative{text, cand[k].prob});
+            }
+
+            if (options.empty()) continue;
+
+            CWordAlternatives entry;
+            entry.tgt_begin = word_begin;
+            entry.tgt_end = word_end;
+            entry.confidence = cand[0].prob;
+            entry.option_count = options.size();
+            entry.options = new CAlternative[options.size()];
+            std::memcpy(entry.options, options.data(),
+                        options.size() * sizeof(CAlternative));
+            out.push_back(entry);
+        }
+    }
+}
+
+static CTranslation* responses_to_c(std::vector<Response>&& responses,
+                                    bool include_alignments,
+                                    const Vocabulary* target_vocab,
+                                    size_t max_alternatives, float gate) {
     const size_t count = responses.size();
     auto* results = new CTranslation[count];
     for (size_t i = 0; i < count; ++i) {
@@ -241,6 +406,19 @@ static CTranslation* responses_to_c(std::vector<Response>&& responses, bool incl
         } else {
             results[i].alignment_count = 0;
             results[i].alignments = nullptr;
+        }
+
+        if (target_vocab) {
+            std::vector<CWordAlternatives> alternatives;
+            extract_alternatives(resp, *target_vocab, max_alternatives, gate,
+                                 alternatives);
+            results[i].alternatives_count = alternatives.size();
+            results[i].alternatives = new CWordAlternatives[alternatives.size()];
+            std::memcpy(results[i].alternatives, alternatives.data(),
+                        alternatives.size() * sizeof(CWordAlternatives));
+        } else {
+            results[i].alternatives_count = 0;
+            results[i].alternatives = nullptr;
         }
     }
     return results;
@@ -323,7 +501,7 @@ CTranslation* slimt_service_translate(void* service_ptr,
             handles.push_back(service->translate(model, std::move(source), options));
         }
 
-        return responses_to_c(drain(handles), want_alignment);
+        return responses_to_c(drain(handles), want_alignment, nullptr, 0, 0.0F);
     } catch (const std::exception& e) {
         // Cancellation completes every in-flight Request's promise through an
         // exception (the only value-less future completion C++ offers), so the
@@ -344,6 +522,131 @@ CTranslation* slimt_service_translate(void* service_ptr,
         return nullptr;
     } catch (...) {
         record_error("slimt_service_translate", "unknown C++ exception");
+        return nullptr;
+    }
+}
+
+// Like slimt_service_translate, but additionally harvests per-word alternatives
+// when opts->want_alternatives. Alternatives force a greedy-only decode for
+// those sentences (see slimt Options::alternatives), so the target may differ
+// from the robust-decoded batch output on hard sentences.
+CTranslation* slimt_service_translate_ex(void* service_ptr,
+                                         void* model_ptr,
+                                         const char* const* inputs,
+                                         size_t count,
+                                         const CTranslateOptions* opts,
+                                         slimt_progress_cb on_progress,
+                                         void* user_data,
+                                         const void* cancel_flag) {
+    try {
+        auto* service = static_cast<Async*>(service_ptr);
+        auto& model = *static_cast<std::shared_ptr<Model>*>(model_ptr);
+
+        service->set_cancel_flag(cancel_flag);
+        CancelGuard cancel_guard{service};
+
+        Options options;
+        options.alignment = opts->want_alignment;
+        if (opts->want_alternatives) {
+            size_t k = opts->max_alternatives == 0 ? 5 : opts->max_alternatives;
+            // Harvest a couple beyond the requested count so the filters have
+            // slack before hitting the cap.
+            options.alternatives = slimt::AlternativesConfig{k + 3, opts->gate};
+        }
+
+        std::vector<Handle> handles;
+        handles.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            if (on_progress) {
+                size_t weight = inputs[i] ? std::strlen(inputs[i]) : 0;
+                options.on_progress = [on_progress, user_data, weight]() {
+                    on_progress(user_data, weight);
+                };
+            }
+            std::string source(inputs[i] ? inputs[i] : "");
+            handles.push_back(service->translate(model, std::move(source), options));
+        }
+
+        const Vocabulary* vocab =
+            opts->want_alternatives ? &model->target_vocabulary() : nullptr;
+        size_t k = opts->max_alternatives == 0 ? 5 : opts->max_alternatives;
+        return responses_to_c(drain(handles), opts->want_alignment, vocab, k,
+                              opts->gate);
+    } catch (const std::exception& e) {
+        bool cancelled = cancel_flag != nullptr &&
+                         __atomic_load_n(
+                             static_cast<const unsigned char*>(cancel_flag),
+                             __ATOMIC_RELAXED) != 0;
+        if (cancelled) {
+            return nullptr;
+        }
+        record_error("slimt_service_translate_ex", e.what());
+        for (size_t i = 0; i < count; ++i) {
+            SLIMT_LOG("input[%zu]: %s", i, log_excerpt(inputs[i]).c_str());
+        }
+        return nullptr;
+    } catch (...) {
+        record_error("slimt_service_translate_ex", "unknown C++ exception");
+        return nullptr;
+    }
+}
+
+// Constrained re-translation: force each `prefixes[i]` as the target prefix
+// (encoded with the target vocab), then free-run the tail and harvest fresh
+// alternatives on it. `prefixes[i]` should be the confirmed target text up to
+// and including the user's chosen word. Always greedy (forcing requires it).
+CTranslation* slimt_service_steer(void* service_ptr,
+                                  void* model_ptr,
+                                  const char* const* sources,
+                                  const char* const* prefixes,
+                                  size_t count,
+                                  const CTranslateOptions* opts,
+                                  slimt_progress_cb on_progress,
+                                  void* user_data,
+                                  const void* cancel_flag) {
+    try {
+        auto* service = static_cast<Async*>(service_ptr);
+        auto& model = *static_cast<std::shared_ptr<Model>*>(model_ptr);
+        const Vocabulary& target_vocab = model->target_vocabulary();
+
+        service->set_cancel_flag(cancel_flag);
+        CancelGuard cancel_guard{service};
+
+        size_t k = opts->max_alternatives == 0 ? 5 : opts->max_alternatives;
+
+        std::vector<Handle> handles;
+        handles.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            Options options;
+            options.alignment = opts->want_alignment;
+            options.alternatives = slimt::AlternativesConfig{k + 3, opts->gate};
+            std::string prefix(prefixes[i] ? prefixes[i] : "");
+            options.forced_prefix =
+                std::get<0>(target_vocab.encode(prefix, /*add_eos=*/false));
+            if (on_progress) {
+                size_t weight = sources[i] ? std::strlen(sources[i]) : 0;
+                options.on_progress = [on_progress, user_data, weight]() {
+                    on_progress(user_data, weight);
+                };
+            }
+            std::string source(sources[i] ? sources[i] : "");
+            handles.push_back(service->translate(model, std::move(source), options));
+        }
+
+        return responses_to_c(drain(handles), opts->want_alignment,
+                              &target_vocab, k, opts->gate);
+    } catch (const std::exception& e) {
+        bool cancelled = cancel_flag != nullptr &&
+                         __atomic_load_n(
+                             static_cast<const unsigned char*>(cancel_flag),
+                             __ATOMIC_RELAXED) != 0;
+        if (cancelled) {
+            return nullptr;
+        }
+        record_error("slimt_service_steer", e.what());
+        return nullptr;
+    } catch (...) {
+        record_error("slimt_service_steer", "unknown C++ exception");
         return nullptr;
     }
 }
@@ -380,7 +683,7 @@ CTranslation* slimt_service_pivot(void* service_ptr,
             handles.push_back(service->pivot(first, second, std::move(source), options));
         }
 
-        return responses_to_c(drain(handles), want_alignment);
+        return responses_to_c(drain(handles), want_alignment, nullptr, 0, 0.0F);
     } catch (const std::exception& e) {
         bool cancelled = cancel_flag != nullptr &&
                          __atomic_load_n(
@@ -403,6 +706,13 @@ void slimt_translations_delete(CTranslation* results, size_t count) {
         delete[] results[i].source;
         delete[] results[i].target;
         delete[] results[i].alignments;
+        for (size_t j = 0; j < results[i].alternatives_count; ++j) {
+            for (size_t k = 0; k < results[i].alternatives[j].option_count; ++k) {
+                delete[] results[i].alternatives[j].options[k].text;
+            }
+            delete[] results[i].alternatives[j].options;
+        }
+        delete[] results[i].alternatives;
     }
     delete[] results;
 }

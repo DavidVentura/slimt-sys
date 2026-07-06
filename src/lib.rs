@@ -17,12 +17,81 @@ struct CTranslation {
     target: *mut c_char,
     alignments: *mut TokenAlignment,
     alignment_count: usize,
+    alternatives: *mut CWordAlternatives,
+    alternatives_count: usize,
 }
 
 pub struct TranslationWithAlignment {
     pub source: String,
     pub target: String,
     pub alignments: Vec<TokenAlignment>,
+}
+
+/// One candidate the model would accept in place of a chosen word, with its
+/// softmax probability at that position.
+#[derive(Debug, Clone)]
+pub struct Alternative {
+    pub text: String,
+    pub prob: f32,
+}
+
+/// A target word the model was not fully confident about, with the alternatives
+/// worth offering. `tgt_begin`/`tgt_end` are char offsets into the target text.
+#[derive(Debug, Clone)]
+pub struct WordAlternatives {
+    pub tgt_begin: usize,
+    pub tgt_end: usize,
+    pub confidence: f32,
+    pub options: Vec<Alternative>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranslationWithAlternatives {
+    pub source: String,
+    pub target: String,
+    pub alignments: Vec<TokenAlignment>,
+    pub alternatives: Vec<WordAlternatives>,
+}
+
+/// Knobs for [`BlockingService::translate_with_alternatives`]. `max_alternatives`
+/// caps how many options each word carries; `gate` is the minimum probability an
+/// alternative needs to be surfaced.
+#[derive(Debug, Clone, Copy)]
+pub struct AlternativesOptions {
+    pub max_alternatives: usize,
+    pub gate: f32,
+}
+
+impl Default for AlternativesOptions {
+    fn default() -> Self {
+        Self {
+            max_alternatives: 3,
+            gate: 0.03,
+        }
+    }
+}
+
+#[repr(C)]
+struct CAlternative {
+    text: *mut c_char,
+    prob: f32,
+}
+
+#[repr(C)]
+struct CWordAlternatives {
+    tgt_begin: usize,
+    tgt_end: usize,
+    confidence: f32,
+    options: *mut CAlternative,
+    option_count: usize,
+}
+
+#[repr(C)]
+struct CTranslateOptions {
+    want_alignment: bool,
+    want_alternatives: bool,
+    max_alternatives: usize,
+    gate: f32,
 }
 
 /// Fired once per input sentence as it finishes, from a slimt worker thread
@@ -53,6 +122,29 @@ unsafe extern "C" {
         inputs: *const *const c_char,
         count: usize,
         want_alignment: bool,
+        on_progress: Option<ProgressCb>,
+        user_data: *mut c_void,
+        cancel_flag: *const c_void,
+    ) -> *mut CTranslation;
+
+    fn slimt_service_translate_ex(
+        service_ptr: *mut c_void,
+        model_ptr: *mut c_void,
+        inputs: *const *const c_char,
+        count: usize,
+        opts: *const CTranslateOptions,
+        on_progress: Option<ProgressCb>,
+        user_data: *mut c_void,
+        cancel_flag: *const c_void,
+    ) -> *mut CTranslation;
+
+    fn slimt_service_steer(
+        service_ptr: *mut c_void,
+        model_ptr: *mut c_void,
+        sources: *const *const c_char,
+        prefixes: *const *const c_char,
+        count: usize,
+        opts: *const CTranslateOptions,
         on_progress: Option<ProgressCb>,
         user_data: *mut c_void,
         cancel_flag: *const c_void,
@@ -363,6 +455,83 @@ impl BlockingService {
         out
     }
 
+    /// Translate and, for each low-confidence target word, surface the
+    /// alternatives the model would accept there (filtered to whole-word,
+    /// non-reordering, non-inflection candidates above `opts.gate`). Forces a
+    /// greedy decode, so hard sentences may translate differently than
+    /// [`Self::translate`] would.
+    pub fn translate_with_alternatives(
+        &self,
+        model: &TranslationModel,
+        inputs: &[&str],
+        opts: AlternativesOptions,
+    ) -> Vec<TranslationWithAlternatives> {
+        let (c_inputs, ptrs) = prepare_inputs(inputs);
+        if ptrs.is_empty() {
+            return Vec::new();
+        }
+        let c_opts = CTranslateOptions {
+            want_alignment: true,
+            want_alternatives: true,
+            max_alternatives: opts.max_alternatives,
+            gate: opts.gate,
+        };
+        let raw = unsafe {
+            slimt_service_translate_ex(
+                self.ptr,
+                model.ptr,
+                ptrs.as_ptr(),
+                ptrs.len(),
+                &c_opts,
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        let out = collect_ex(raw, ptrs.len());
+        drop(c_inputs);
+        out
+    }
+
+    /// Re-translate `source` with `target_prefix` forced as the start of the
+    /// output (the confirmed text up to and including a user-picked word), then
+    /// free-run the rest. The result carries fresh alternatives on the free-run
+    /// tail so the user can keep steering.
+    pub fn translate_with_prefix(
+        &self,
+        model: &TranslationModel,
+        source: &str,
+        target_prefix: &str,
+        opts: AlternativesOptions,
+    ) -> TranslationWithAlternatives {
+        let c_source = CString::new(source).expect("source contains nul");
+        let c_prefix = CString::new(target_prefix).expect("prefix contains nul");
+        let src_ptrs = [c_source.as_ptr()];
+        let pfx_ptrs = [c_prefix.as_ptr()];
+        let c_opts = CTranslateOptions {
+            want_alignment: true,
+            want_alternatives: true,
+            max_alternatives: opts.max_alternatives,
+            gate: opts.gate,
+        };
+        let raw = unsafe {
+            slimt_service_steer(
+                self.ptr,
+                model.ptr,
+                src_ptrs.as_ptr(),
+                pfx_ptrs.as_ptr(),
+                1,
+                &c_opts,
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        let mut out = collect_ex(raw, 1);
+        drop((c_source, c_prefix));
+        out.pop().expect("steer returned no result")
+    }
+
     pub fn pivot(
         &self,
         first: &TranslationModel,
@@ -551,6 +720,78 @@ fn collect(
             source,
             target,
             alignments,
+        });
+    }
+    unsafe { slimt_translations_delete(raw, count) };
+    out
+}
+
+fn collect_ex(raw: *mut CTranslation, count: usize) -> Vec<TranslationWithAlternatives> {
+    assert!(!raw.is_null(), "slimt translation failed: {}", last_error());
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let c_result = unsafe { &*raw.add(i) };
+        let source = unsafe { CStr::from_ptr(c_result.source) }
+            .to_string_lossy()
+            .into_owned();
+        let target = unsafe { CStr::from_ptr(c_result.target) }
+            .to_string_lossy()
+            .into_owned();
+        let src_offsets = byte_to_char_offsets(&source);
+        let tgt_offsets = byte_to_char_offsets(&target);
+
+        let alignments = if c_result.alignment_count > 0 {
+            let byte_alignments = unsafe {
+                std::slice::from_raw_parts(c_result.alignments, c_result.alignment_count)
+            };
+            byte_alignments
+                .iter()
+                .map(|a| TokenAlignment {
+                    src_begin: src_offsets[a.src_begin],
+                    src_end: src_offsets[a.src_end],
+                    tgt_begin: tgt_offsets[a.tgt_begin],
+                    tgt_end: tgt_offsets[a.tgt_end],
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let alternatives = if c_result.alternatives_count > 0 {
+            let words = unsafe {
+                std::slice::from_raw_parts(c_result.alternatives, c_result.alternatives_count)
+            };
+            words
+                .iter()
+                .map(|w| {
+                    let options = unsafe {
+                        std::slice::from_raw_parts(w.options, w.option_count)
+                    }
+                    .iter()
+                    .map(|o| Alternative {
+                        text: unsafe { CStr::from_ptr(o.text) }
+                            .to_string_lossy()
+                            .into_owned(),
+                        prob: o.prob,
+                    })
+                    .collect();
+                    WordAlternatives {
+                        tgt_begin: tgt_offsets[w.tgt_begin],
+                        tgt_end: tgt_offsets[w.tgt_end],
+                        confidence: w.confidence,
+                        options,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        out.push(TranslationWithAlternatives {
+            source,
+            target,
+            alignments,
+            alternatives,
         });
     }
     unsafe { slimt_translations_delete(raw, count) };
