@@ -424,11 +424,17 @@ static CTranslation* responses_to_c(std::vector<Response>&& responses,
     return results;
 }
 
+// A request the caller stops waiting for is still in the batcher, and
+// completing it later would run the caller's progress callback after this call
+// has returned.
 static std::vector<Response> drain(std::vector<Handle>& handles) {
+    for (auto& handle : handles) {
+        handle.future().wait();
+    }
+
     std::vector<Response> responses;
     responses.reserve(handles.size());
     for (auto& handle : handles) {
-        handle.future().wait();
         responses.push_back(handle.future().get());
     }
     return responses;
