@@ -237,11 +237,11 @@ fn main() {
         println!("cargo:rustc-link-lib=c++_shared");
     } else if target_os == "macos" || target_os == "ios" {
         println!("cargo:rustc-link-lib=c++");
-    } else {
+    } else if target_os != "windows" {
         println!("cargo:rustc-link-lib=stdc++");
     }
 
-    if !is_android {
+    if !is_android && target_os != "windows" {
         println!("cargo:rustc-link-lib=pthread");
     }
 }

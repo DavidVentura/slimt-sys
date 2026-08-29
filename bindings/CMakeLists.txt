@@ -37,6 +37,14 @@ if(SLIMT_ENABLE_LTO)
   endif()
 endif()
 
+# cpuinfo's utils.h calls _BitScanReverse under _MSC_VER without including
+# <intrin.h>; clang-cl rejects that. cpuinfo is an upstream submodule two levels
+# down (ruy -> cpuinfo), so force the include from here instead of forking it.
+if(MSVC)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /FIintrin.h")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FIintrin.h")
+endif()
+
 # slimt build options - ruy is the only backend.
 set(WITH_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
