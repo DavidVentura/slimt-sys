@@ -88,7 +88,12 @@ endif()
 # avoids accidentally baking AVX-only instructions into Android-shippable
 # binaries. ARM doesn't get a counterpart — slimt's ruy backend does runtime
 # CPU detection.
-if(SLIMT_X86_BASELINE)
+# Under clang-cl, `-march=` silently overrides a later `/arch:AVX2`, so setting
+# the baseline globally would strip AVX2/AVX512 from ruy's per-target kernel
+# translation units. ruy then reports no built SIMD path and dispatches to its
+# kStandardCpp reference kernel — ~75x slower, with no diagnostic. Apply the
+# baseline to slimt's own targets only and leave ruy's dispatch alone.
+if(SLIMT_X86_BASELINE AND NOT MSVC)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=${SLIMT_X86_BASELINE}")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=${SLIMT_X86_BASELINE}")
 endif()
@@ -101,8 +106,15 @@ include_directories(${SLIMT_SOURCE_DIR} ${CMAKE_BINARY_DIR}/slimt)
 
 add_subdirectory(${SLIMT_SOURCE_DIR} slimt EXCLUDE_FROM_ALL)
 
+if(SLIMT_X86_BASELINE AND MSVC)
+  target_compile_options(slimt-static PRIVATE -march=${SLIMT_X86_BASELINE})
+endif()
+
 add_library(slimt_wrapper STATIC slimt_wrapper.cpp)
 target_link_libraries(slimt_wrapper PRIVATE slimt-static)
 target_include_directories(slimt_wrapper PRIVATE ${SLIMT_SOURCE_DIR})
+if(SLIMT_X86_BASELINE AND MSVC)
+  target_compile_options(slimt_wrapper PRIVATE -march=${SLIMT_X86_BASELINE})
+endif()
 
 install(TARGETS slimt_wrapper ARCHIVE DESTINATION lib)
