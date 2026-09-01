@@ -343,6 +343,27 @@ const CASES: &[Case] = &[
         input: "good morning",
         expected: "おはようございます",
     },
+    // ka→en: digit passthrough under the shortlist. The student trained under
+    // subword sampling and writes "404" as ▁4+04 part of the time; the lexical
+    // table, built from one deterministic segmentation, never held `04`, so the
+    // shortlisted decode produced "Error 44" / "Room 440" while the
+    // full-vocabulary decode was right. Guards the digit-piece admission in
+    // ShortlistGenerator::generate.
+    Case {
+        pair: "kaen",
+        input: "შეცდომა 404: მოთხოვნილი რესურსი ვერ მოიძებნა.",
+        expected: "Error 404: The requested resource could not be found.",
+    },
+    Case {
+        pair: "kaen",
+        input: "ოთახი 404",
+        expected: "Room 404",
+    },
+    Case {
+        pair: "kaen",
+        input: "წნევა 140/90",
+        expected: "Pressure 140/90",
+    },
 ];
 
 fn models_dir() -> Option<PathBuf> {
